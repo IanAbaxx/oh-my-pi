@@ -2565,9 +2565,9 @@ export const SETTINGS_SCHEMA = {
 				"Use larger context windows where supported; may incur premium pricing. Off keeps default or standard-pricing windows",
 		},
 	},
-	// Per-turn time stamp: fresh Now: instant appended to the last user
-	// message of each provider request (context tail — prompt-cache prefix
-	// stays byte-stable; toggle with /time).
+	// Per-turn time stamp: each user message carries a Now: stamp of its own
+	// turn (derived from its persisted timestamp, byte-stable across
+	// requests and session resumes; toggle with /time).
 	"prompt.nowStamp": {
 		type: "boolean",
 		default: true,
@@ -2576,7 +2576,7 @@ export const SETTINGS_SCHEMA = {
 			group: "General",
 			label: "Per-turn Time Stamp",
 			description:
-				"Append a fresh Now: timestamp to the last user message of each provider request so the model always knows the current time (toggle with /time)",
+				"Append a Now: timestamp of its own turn to each user message so the model always knows the current time (toggle with /time)",
 		},
 	},
 
