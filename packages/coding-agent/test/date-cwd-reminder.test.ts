@@ -368,7 +368,8 @@ describe("date-cwd-reminder", () => {
 				timestamp: t,
 			});
 
-			const out = injectNowStamp([makeSummary()])[0] as UserMessage;
+			const input = makeSummary();
+			const out = injectNowStamp([input])[0] as UserMessage;
 
 			const payload = out.providerPayload;
 			expect(payload?.type).toBe("openaiResponsesHistory");
@@ -380,7 +381,10 @@ describe("date-cwd-reminder", () => {
 			// The generic content is still stamped for providers without native
 			// replay, and the input payload is never mutated.
 			expect(textOf(out)).toBe(`${content}\n\n${stamp}`);
-			expect(historyItems).toHaveLength(1);
+			if (input.providerPayload?.type !== "openaiResponsesHistory")
+				throw new Error("expected openaiResponsesHistory input payload");
+			expect(input.providerPayload.items).toHaveLength(1);
+			expect(input.providerPayload.items).toEqual(historyItems);
 
 			// Byte-stable re-derivation: a rehydrated copy (fresh objects, same
 			// persisted bytes) yields identical provider-visible wire bytes.
