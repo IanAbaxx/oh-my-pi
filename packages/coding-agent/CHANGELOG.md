@@ -49,6 +49,7 @@
 - Python cells are no longer replayed automatically after a kernel crash, preventing duplicate side effects; the next call starts a fresh kernel.
 - Session rewrites preserve open-reader snapshots and replacement identity when a rename needs an EPERM fallback.
 - Fixed WorkPool children retaining a stale Gemini-formatted `yield` declaration when pooled items were installed or cleared.
+- Added a per-turn `Now:` timestamp stamp (UTC ISO instant plus local clock, timezone short name, and numeric UTC offset, e.g. `Now: 2026-08-30T02:51:16Z (20:51 CDT, UTC-05:00)`) appended to each user message and each user-initiated developer continuation turn, derived deterministically from that message's own turn timestamp, so re-stamped history stays byte-identical across requests, tool-call loops, and same-host session resumes (the parenthesized local part of the stamp renders in the host timezone and locale), and the prompt-cache prefix is preserved. A prompt that already ends in a `Now:` block carrying a different value is re-stamped with the derived one rather than left stale. Toggle with `/time` (persisted `prompt.nowStamp` setting, default on).
 
 ## [18.1.14] - 2026-09-07
 
@@ -125,7 +126,6 @@
 
 - Fixed Codex V2 remote compaction rebuilding the request prefix differently from normal turns, restoring prompt-cache reuse ([#10786](https://github.com/can1357/oh-my-pi/issues/10786)).
 - Restored mouse clicks, hover, and wheel scrolling in Plan Review.
-- Added a per-turn `Now:` timestamp stamp (UTC ISO instant plus local clock, timezone short name, and numeric UTC offset, e.g. `Now: 2026-08-30T02:51:16Z (20:51 CDT, UTC-05:00)`) appended to each user message and each user-initiated developer continuation turn, derived deterministically from that message's own turn timestamp, so re-stamped history stays byte-identical across requests, tool-call loops, and same-host session resumes (the parenthesized local part of the stamp renders in the host timezone and locale), and the prompt-cache prefix is preserved. A prompt that already ends in a `Now:` block carrying a different value is re-stamped with the derived one rather than left stale. Toggle with `/time` (persisted `prompt.nowStamp` setting, default on).
 
 ## [18.1.9] - 2026-09-04
 
@@ -164,9 +164,6 @@
 ### Removed
 
 - Removed the librarian agent.
-### Added
-
-- Added a per-turn `Now:` timestamp stamp (UTC ISO instant plus local clock, timezone short name, and numeric UTC offset, e.g. `Now: 2026-08-30T02:51:16Z (20:51 CDT, UTC-05:00)`) appended to each user message, derived deterministically from that message's own turn timestamp, so re-stamped history stays byte-identical across requests, tool-call loops, and same-host session resumes (the parenthesized local part of the stamp renders in the host timezone and locale), and the prompt-cache prefix is preserved. Toggle with `/time` (persisted `prompt.nowStamp` setting, default on).
 
 ## [18.1.8] - 2026-09-03
 
