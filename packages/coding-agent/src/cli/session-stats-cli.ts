@@ -28,6 +28,12 @@ export interface SessionStatsCommandArgs {
 	out?: (text: string) => void;
 	/** Error sink for the failure message (defaults to `console.error`). */
 	err?: (text: string) => void;
+	/**
+	 * Called with a non-zero exit code on failure; defaults to setting
+	 * `process.exitCode`, which tests replace with a recorder so the
+	 * process-global is never touched.
+	 */
+	setExitCode?: (code: number) => void;
 }
 
 export interface SessionStatsResult {
@@ -281,6 +287,11 @@ export async function runSessionStatsCommand(args: SessionStatsCommandArgs): Pro
 	const out = args.out ?? ((text: string) => console.log(text));
 	const err = args.err ?? ((text: string) => console.error(text));
 	const agentDir = args.agentDir ?? getAgentDir();
+	const setExitCode =
+		args.setExitCode ??
+		((code: number) => {
+			process.exitCode = code;
+		});
 	try {
 		const sessionFile = await resolveSessionFile(args.ref, agentDir);
 		const stats = await computeSessionStats(sessionFile);
@@ -288,6 +299,6 @@ export async function runSessionStatsCommand(args: SessionStatsCommandArgs): Pro
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		err(`omp session-stats: ${message}`);
-		process.exitCode = 1;
+		setExitCode(1);
 	}
 }

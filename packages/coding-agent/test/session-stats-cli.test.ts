@@ -9,7 +9,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/cli/session-stats-cli";
 
 let root: string;
-const originalExitCode = process.exitCode;
 
 /** Fixture entries for session "test-session"; e6 is an abandoned fork (off-branch). */
 function fixtureLines() {
@@ -91,11 +90,9 @@ async function writeSession(project: string, filename: string, lines: string[]):
 
 beforeEach(async () => {
 	root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-session-stats-"));
-	process.exitCode = 0;
 });
 
 afterEach(async () => {
-	process.exitCode = originalExitCode;
 	await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -253,13 +250,15 @@ describe("runSessionStatsCommand", () => {
 		const file = await writeSession("project", "2026-01-01T00-00-00-000Z_test-session", fixtureLines());
 		const out: string[] = [];
 		const err: string[] = [];
+		const exitCodes: number[] = [];
 		await runSessionStatsCommand({
 			ref: "previous",
 			agentDir: root,
 			out: text => out.push(text),
 			err: text => err.push(text),
+			setExitCode: code => exitCodes.push(code),
 		});
-		expect(process.exitCode).toBe(0);
+		expect(exitCodes).toEqual([]);
 		const parsed = JSON.parse(out.join("")) as Record<string, unknown>;
 		expect(parsed.session_id).toBe("test-session");
 		expect(parsed.input_tokens).toBe(165);
@@ -271,17 +270,19 @@ describe("runSessionStatsCommand", () => {
 		expect(err.join("")).toBe("");
 	});
 
-	test("sets exit code 1 and an error message for an unknown id", async () => {
+	test("reports an unknown id through the exit-code and error sinks", async () => {
 		await writeSession("project", "2026-01-01T00-00-00-000Z_test-session", fixtureLines());
 		const out: string[] = [];
 		const err: string[] = [];
+		const exitCodes: number[] = [];
 		await runSessionStatsCommand({
 			ref: "no-such-session",
 			agentDir: root,
 			out: text => out.push(text),
 			err: text => err.push(text),
+			setExitCode: code => exitCodes.push(code),
 		});
-		expect(process.exitCode).toBe(1);
+		expect(exitCodes).toEqual([1]);
 		expect(err.join("")).toContain('no session with id "no-such-session"');
 		expect(out.join("")).toBe("");
 	});
