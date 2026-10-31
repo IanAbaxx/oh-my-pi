@@ -799,7 +799,7 @@ describe("E7 facts scope migration", () => {
 		}
 	});
 
-	it("get-by-id hides a fact when the same id exists privately in the other tier", () => {
+	it("get-by-id follows the fact's recorded provenance tier", () => {
 		const dbPath = tempDb();
 		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
 		try {
@@ -813,23 +813,148 @@ describe("E7 facts scope migration", () => {
 			const factId = (beamA.db
 				.query("SELECT fact_id FROM facts WHERE source_msg_id = 'wm-dual'")
 				.get() as { fact_id: string }).fact_id;
-			// The same conservative rule applies in factRecall, so no session that
-			// cannot see the private episode row resolves the fact — including
-			// session-a, which only owns the global working row.
+			// The fact is working-derived: the private episode row sharing the id
+			// no longer masks it, so a session owning neither row still resolves
+			// it through the global working source.
 			const beamC = new BeamMemory({ sessionId: "session-c", dbPath });
 			try {
-				expect(get(beamC, factId)).toBeNull();
+				expect(get(beamC, factId)).not.toBeNull();
 			} finally {
 				beamC.close();
 			}
-			const beamD = new BeamMemory({ sessionId: "session-b", dbPath });
+			// Legacy rows without provenance keep the conservative both-tiers
+			// rule: a private same-id row in either tier retires the fact for
+			// sessions that cannot see it.
+			beamA.db.run("UPDATE facts SET source_tier = NULL WHERE fact_id = ?", [factId]);
+			const beamD = new BeamMemory({ sessionId: "session-c", dbPath });
 			try {
-				expect(get(beamD, factId)).not.toBeNull();
+				expect(get(beamD, factId)).toBeNull();
 			} finally {
 				beamD.close();
 			}
+			const beamE = new BeamMemory({ sessionId: "session-b", dbPath });
+			try {
+				expect(get(beamE, factId)).not.toBeNull();
+			} finally {
+				beamE.close();
+			}
 		} finally {
 			beamA.close();
+		}
+	});
+
+	it("fact recall follows the fact's recorded provenance tier", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('x9', 'episode text', 'session-a', 'global')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "x9");
+			const tier = beamA.db.query("SELECT source_tier FROM facts WHERE source_msg_id = 'x9'").get() as { source_tier: string | null };
+			expect(tier.source_tier).toBe("episodic");
+			// A session-private working row sharing the id must not hide the
+			// episode-derived global fact: the fact's source is the episode.
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('x9', 'working text', 'session-b', 'session')",
+			);
+			const hits = factRecall(beamA, "quorum relay") as { content: string }[];
+			expect(hits.some(h => h.content.includes("quorum relay"))).toBe(true);
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("tier-scoped collision purge preserves the other tier's graph edges", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('e4', 'working text', 'session-a', 'global')",
+			);
+			beamA.db.run(
+				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('e4', 'episode text', 'session-b', 'session')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "e4");
+			beamA.db.run(
+				"INSERT INTO graph_edges (source, target, edge_type, weight, timestamp) VALUES ('e4', 'node-e4', 'ctx', 1, '2026-01-01T00:00:00.000Z')",
+			);
+			updateWorking(beamA, "e4", "reworded working text");
+			// The working-derived fact retires with the content change...
+			const facts = beamA.db.query("SELECT fact_id FROM facts WHERE source_msg_id = 'e4'").all() as { fact_id: string }[];
+			expect(facts.length).toBe(0);
+			// ...but the graph edge touching the shared memory id (owned by the
+			// untouched tier) survives.
+			const edge = beamA.db.query("SELECT source FROM graph_edges WHERE source = 'e4' AND target = 'node-e4'").get() as { source: string } | null;
+			expect(edge).not.toBeNull();
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("ABA re-scope rotates the extraction generation", async () => {
+		let calls = 0;
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath: tempDb(),
+			llm: {
+				enabled: true,
+				complete: async () => {
+					calls++;
+					return calls === 1
+						? "I use the quorum relay for tokens"
+						: calls === 2
+							? "I use the signal lamp for status"
+							: "I use the backup vault for keys";
+				},
+			},
+		});
+		try {
+			const text = "stored text";
+			const id = memory.remember(text, { source: "test", scope: "global", extract: true, extractText: "T1" });
+			// global -> session -> global while the first task awaits: the final
+			// state matches the first snapshot again (same content, same scope),
+			// so only the per-change generation can tell the incarnations apart.
+			const second = memory.remember(text, { source: "test", scope: "session", extract: true, extractText: "T2" });
+			const third = memory.remember(text, { source: "test", scope: "global", extract: true, extractText: "T3" });
+			expect(second).toBe(id);
+			expect(third).toBe(id);
+			await memory.flushExtractions();
+			expect(calls).toBe(3);
+			const objs = (memory.conn.query("SELECT object FROM facts").all() as { object: string }[]).map(r => r.object);
+			expect(objs.some(o => o.includes("backup vault"))).toBe(true);
+			expect(objs.some(o => o.includes("quorum relay"))).toBe(false);
+			expect(objs.some(o => o.includes("signal lamp"))).toBe(false);
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
+		}
+	});
+
+	it("honors an explicit extraction request when nothing is pending", async () => {
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath: tempDb(),
+			llm: { enabled: true, complete: async () => "The user uses the quorum relay for tokens" },
+		});
+		try {
+			const text = "stored text";
+			const id = memory.remember(text, { source: "test", extract: true });
+			// Edit the content away and back: both changes rotate the generation
+			// and the original task discards itself, leaving the row without facts.
+			updateWorking(memory.beam, id, "other text");
+			updateWorking(memory.beam, id, text);
+			await memory.flushExtractions();
+			expect((memory.conn.query("SELECT fact_id FROM facts WHERE source_msg_id = ?").all(id) as unknown[]).length).toBe(0);
+			// A later duplicate remember requesting extraction must still run:
+			// no task is pending, so the request is not suppressed.
+			const dup = memory.remember(text, { source: "test", extract: true });
+			expect(dup).toBe(id);
+			await memory.flushExtractions();
+			expect((memory.conn.query("SELECT fact_id FROM facts WHERE source_msg_id = ?").all(id) as unknown[]).length).toBeGreaterThan(0);
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
 		}
 	});
 

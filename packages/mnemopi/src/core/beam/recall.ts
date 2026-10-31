@@ -435,6 +435,11 @@ function factsHaveScopeColumn(beam: BeamMemoryState): boolean {
 	return rows.some(row => asString(row.name) === "scope");
 }
 
+function factsHaveTierColumn(beam: BeamMemoryState): boolean {
+	const rows = queryAll(beam, "PRAGMA table_info(facts)");
+	return rows.some(row => asString(row.name) === "source_tier");
+}
+
 function factVisibilityWhere(beam: BeamMemoryState, tableAlias: string): { where: string; params: DbValue[] } {
 	const prefix = tableAlias.length === 0 ? "" : `${tableAlias}.`;
 	const scope = factsHaveScopeColumn(beam)
@@ -444,11 +449,18 @@ function factVisibilityWhere(beam: BeamMemoryState, tableAlias: string): { where
 	// entry or the episode a consolidation produced: once that source is explicitly
 	// superseded (`memory_edit invalidate`) or has expired, the fact must stop surfacing,
 	// otherwise an explicit invalidation is silently defeated at the fact layer.
-	// Correlated EXISTS probes the source's primary key in both tiers (same shape as the
-	// fts_working / fts_episodes visibility predicates). Facts whose source row no longer
-	// exists in either tier stay visible: nothing contradicts them.
-	const sourceSuperseded = `NOT EXISTS (SELECT 1 FROM working_memory w WHERE w.id = ${prefix}source_msg_id AND (w.superseded_by IS NOT NULL OR (w.valid_until IS NOT NULL AND w.valid_until <= ?)))`;
-	const episodeSuperseded = `NOT EXISTS (SELECT 1 FROM episodic_memory e WHERE e.id = ${prefix}source_msg_id AND (e.superseded_by IS NOT NULL OR (e.valid_until IS NOT NULL AND e.valid_until <= ?)))`;
+	// Each correlated EXISTS probe follows the fact's recorded provenance tier
+	// (same shape as the fts_working / fts_episodes visibility predicates): a
+	// working-derived fact is judged by the working row alone and an
+	// episode-derived fact by the episode row alone, so a retired or private
+	// same-id row in the other tier does not affect it. Only legacy rows
+	// without provenance keep the conservative both-tiers probe. Facts whose
+	// source row no longer exists stay visible: nothing contradicts them.
+	const hasTierColumn = factsHaveTierColumn(beam);
+	const workingSuperseded = `NOT EXISTS (SELECT 1 FROM working_memory w WHERE w.id = ${prefix}source_msg_id AND (w.superseded_by IS NOT NULL OR (w.valid_until IS NOT NULL AND w.valid_until <= ?)))`;
+	const episodeSupersededRaw = `NOT EXISTS (SELECT 1 FROM episodic_memory e WHERE e.id = ${prefix}source_msg_id AND (e.superseded_by IS NOT NULL OR (e.valid_until IS NOT NULL AND e.valid_until <= ?)))`;
+	const sourceSuperseded = hasTierColumn ? `(${prefix}source_tier = 'episodic' OR ${workingSuperseded})` : workingSuperseded;
+	const episodeSuperseded = hasTierColumn ? `(${prefix}source_tier = 'working' OR ${episodeSupersededRaw})` : episodeSupersededRaw;
 	// A fact must never outshine its source: if the source row still exists but
 	// was narrowed from global to session scope after extraction, the fact must
 	// stop being visible cross-session (or the narrowing would be silently
@@ -456,8 +468,10 @@ function factVisibilityWhere(beam: BeamMemoryState, tableAlias: string): { where
 	// A NULL scope is treated as 'session', and a NULL owner matches no
 	// caller session — including an explicitly empty session id, which a
 	// COALESCE to '' would wrongly equate with the missing owner.
-	const sourceVisible = `NOT EXISTS (SELECT 1 FROM working_memory w WHERE w.id = ${prefix}source_msg_id AND NOT (COALESCE(w.scope, 'session') = 'global' OR (w.session_id IS NOT NULL AND w.session_id = ?)))`;
-	const episodeVisible = `NOT EXISTS (SELECT 1 FROM episodic_memory e WHERE e.id = ${prefix}source_msg_id AND NOT (COALESCE(e.scope, 'session') = 'global' OR (e.session_id IS NOT NULL AND e.session_id = ?)))`;
+	const workingVisible = `NOT EXISTS (SELECT 1 FROM working_memory w WHERE w.id = ${prefix}source_msg_id AND NOT (COALESCE(w.scope, 'session') = 'global' OR (w.session_id IS NOT NULL AND w.session_id = ?)))`;
+	const episodeVisibleRaw = `NOT EXISTS (SELECT 1 FROM episodic_memory e WHERE e.id = ${prefix}source_msg_id AND NOT (COALESCE(e.scope, 'session') = 'global' OR (e.session_id IS NOT NULL AND e.session_id = ?)))`;
+	const sourceVisible = hasTierColumn ? `(${prefix}source_tier = 'episodic' OR ${workingVisible})` : workingVisible;
+	const episodeVisible = hasTierColumn ? `(${prefix}source_tier = 'working' OR ${episodeVisibleRaw})` : episodeVisibleRaw;
 	return { where: `${scope} AND ${sourceSuperseded} AND ${episodeSuperseded} AND ${sourceVisible} AND ${episodeVisible}`, params: [beam.sessionId, nowIso(), nowIso(), beam.sessionId, beam.sessionId] };
 }
 

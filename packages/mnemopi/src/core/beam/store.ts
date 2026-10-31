@@ -207,8 +207,13 @@ function purgeWorkingMemoryArtifacts(
 	// left untouched.
 	const tierFilter = options.factTiers === undefined ? "" : ` AND ${factTierPredicate(options.factTiers)}`;
 
-	const graphRefs = new Set<string>(ids);
-	for (const id of ids) graphRefs.add(`gist_${id}`);
+	// Tier-scoped (collision) purges remove only edges tied to the selected
+	// fact ids: the raw memory and gist ids are shared with the untouched
+	// tier, whose ctx/related edges must survive.
+	const graphRefs = new Set<string>(options.factTiers === undefined ? ids : []);
+	if (options.factTiers === undefined) {
+		for (const id of ids) graphRefs.add(`gist_${id}`);
+	}
 	if (tableExists(db, "facts")) {
 		using factStatement = db.prepare(`SELECT fact_id FROM facts WHERE source_msg_id IN (${placeholders})${tierFilter}`);
 		const factRows = factStatement.all(...ids) as {
@@ -422,9 +427,14 @@ function scheduleFactExtraction(beam: BeamMemoryState, memoryId: string, content
 		runFactExtraction(beam, memoryId, content, scheduled, scheduledScope),
 	);
 	const pending = beam.pendingExtractions;
+	const pendingIds = beam.pendingExtractionIds;
 	if (pending !== undefined) {
 		pending.add(task);
 		void task.finally(() => pending.delete(task));
+	}
+	if (pendingIds !== undefined) {
+		pendingIds.add(memoryId);
+		void task.finally(() => pendingIds.delete(memoryId));
 	}
 }
 
@@ -542,12 +552,15 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		// The scope as stored before this duplicate write, so the extraction
 		// reschedule below can tell a real re-scope from a repeated value.
 		const storedScope = beam.db
-			.prepare("SELECT scope FROM working_memory WHERE id = ? AND session_id = ?")
-			.get(existingId, beam.sessionId) as { scope: string | null } | undefined;
+			.prepare("SELECT scope, generation FROM working_memory WHERE id = ? AND session_id = ?")
+			.get(existingId, beam.sessionId) as { scope: string | null; generation: string | null } | undefined;
+		const scopeChanged =
+			options.scope !== undefined && options.scope !== (storedScope?.scope ?? "session");
 		beam.db.run(
 			`
 				UPDATE working_memory
 				SET importance = MAX(importance, ?), timestamp = ?, source = ?,
+					generation = ?,
 					valid_until = COALESCE(?, valid_until),
 					scope = COALESCE(?, scope),
 					author_id = COALESCE(?, author_id),
@@ -564,6 +577,10 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 				importance,
 				timestamp,
 				source,
+				// A real scope change rotates the extraction generation (an ABA
+				// re-scope must not let a pending task bound to the earlier state
+				// revalidate); anything else re-binds the stored token untouched.
+				scopeChanged ? freshGeneration() : (storedScope?.generation ?? null),
 				validUntil,
 				// An omitted scope keeps the stored value (the variable above was
 				// defaulted to 'session', which would silently narrow a global source).
@@ -588,18 +605,15 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 			metadata: metadata ?? undefined,
 		});
 		if (embedText !== content) scheduleEmbedding(beam, [{ memoryId: existingId, content: embedText }]);
-		// A duplicate write that actually re-scopes the row (the caller named
-		// a different scope than the one stored) invalidates any pending
-		// extraction (its bound scope no longer matches); schedule the
-		// replacement under the updated scope. An omitted scope keeps the
-		// stored value, and a repeated identical scope leaves the token
-		// unchanged — in both cases the pending task remains valid, and a
-		// second LLM pass would only duplicate the projection writes.
-		if (
-			options.extract === true &&
-			options.scope !== undefined &&
-			(storedScope?.scope ?? "session") !== options.scope
-		) {
+		// An explicit extraction request is honored whenever no task is actually
+		// pending for this row — e.g. after a content change retired the earlier
+		// derivatives (the in-flight task then discarded itself). A real scope
+		// change always schedules the replacement: its snapshot is stale and the
+		// generation rotated above kills the old task. Only a genuinely pending
+		// task is suppressed — re-requesting identical content while the
+		// extraction is still in flight would double-run the LLM.
+		const pendingHere = beam.pendingExtractionIds?.has(existingId) ?? false;
+		if (options.extract === true && (scopeChanged || !pendingHere)) {
 			scheduleFactExtraction(beam, existingId, options.extractText ?? options.extract_text ?? content);
 		}
 		invalidateCaches(beam);
@@ -950,7 +964,15 @@ function getFact(beam: BeamMemoryState, memoryId: string): Row | null {
 		const wmSource = beam.db.prepare("SELECT superseded_by, valid_until, session_id, scope FROM working_memory WHERE id = ?").get(sourceId) as SourceRow | null;
 		const epSource = beam.db.prepare("SELECT superseded_by, valid_until, session_id, scope FROM episodic_memory WHERE id = ?").get(sourceId) as SourceRow | null;
 		const now = toUtcIso(new Date());
-		for (const source of [wmSource, epSource]) {
+		// Follow the recorded provenance tier: a working-derived fact is judged
+		// by the working row alone and an episode-derived fact by the episode
+		// row alone, so a private same-id row in the other tier does not hide
+		// it. Legacy rows without provenance keep the conservative both-tiers
+		// probe.
+		const tier = typeof fact.source_tier === "string" ? fact.source_tier : null;
+		const sources: (SourceRow | null)[] =
+			tier === "working" ? [wmSource] : tier === "episodic" ? [epSource] : [wmSource, epSource];
+		for (const source of sources) {
 			if (source == null) continue;
 			if (source.superseded_by != null) return null;
 			if (source.valid_until != null && source.valid_until <= now) return null;
