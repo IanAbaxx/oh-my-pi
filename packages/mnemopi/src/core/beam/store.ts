@@ -633,11 +633,11 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		// Suppression only counts a task pending for the CURRENT generation:
 		// the row's token after the refresh above (rotated on a real scope
 		// change, unchanged otherwise). An older-generation task will discard
-		// itself and must not block this request.
-		const currentGeneration = scopeChanged ? null : (storedScope?.generation ?? null);
-		const pendingHere =
-			currentGeneration !== null &&
-			(beam.pendingExtractionIds?.has(existingId + "\0" + currentGeneration) ?? false);
+		// itself and must not block this request. Legacy rows (pre-upgrade)
+		// carry a NULL generation: both tasks validate against the same NULL
+		// snapshot, so the NULL key must suppress exactly like any other.
+		const pendingKey = existingId + "\0" + (scopeChanged ? null : (storedScope?.generation ?? null));
+		const pendingHere = beam.pendingExtractionIds?.has(pendingKey) ?? false;
 		if (options.extract === true && (scopeChanged || !pendingHere)) {
 			scheduleFactExtraction(beam, existingId, options.extractText ?? options.extract_text ?? content);
 		}

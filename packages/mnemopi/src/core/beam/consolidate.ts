@@ -292,9 +292,20 @@ function insertFactRows(
 	// their facts private. Pre-existing fact rows keep the column's 'session'
 	// default (no retroactive widening).
 	beam.db.run(
-		`INSERT OR IGNORE INTO facts
+		`INSERT INTO facts
 		 (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence, scope, source_tier, channel_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(fact_id) DO UPDATE SET
+			-- A re-extraction that hits an existing fact id refreshes only the
+			-- provenance (source id, tier, channel) — e.g. after the source was
+			-- reassigned to another channel, where IGNORE would keep the stale
+			-- stamp and strand the fact in both channels' recall. Scope, owner,
+			-- and content never change on conflict: re-extraction must not
+			-- retroactively widen or transfer a private fact. Same ownership
+			-- guard as the graph upsert.
+			source_msg_id = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.source_msg_id ELSE facts.source_msg_id END,
+			source_tier = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.source_tier ELSE facts.source_tier END,
+			channel_id = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.channel_id ELSE facts.channel_id END`,
 		[factId, sourceSession(beam), key, factType, value, timestamp, sourceMemoryId, importance, scope, sourceTierOf(beam.db, sourceMemoryId), sourceChannelOf(beam.db, sourceMemoryId)],
 	);
 }

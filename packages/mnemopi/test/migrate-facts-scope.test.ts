@@ -1459,6 +1459,84 @@ describe("E7 facts scope, review round 3", () => {
 		}
 	});
 
+	it("legacy NULL-generation rows still suppress duplicate extraction", async () => {
+		let calls = 0;
+		const gate = Promise.withResolvers<void>();
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		// A pre-upgrade row: no generation token at all.
+		beamA.db.run(
+			"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('leg8', 'stored text', 'session-a', 'global')",
+		);
+		beamA.close();
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath,
+			llm: {
+				enabled: true,
+				complete: async () => {
+					calls++;
+					if (calls === 1) await gate.promise;
+					return "I use the quorum relay for tokens";
+				},
+			},
+		});
+		try {
+			const id = memory.remember("stored text", { source: "test", extract: true });
+			expect(id).toBe("leg8");
+			for (let i = 0; i < 10_000 && memory.beam.pendingExtractionIds.size !== 1; i++) {
+				await Promise.resolve();
+			}
+			expect(memory.beam.pendingExtractionIds.size).toBe(1);
+			// A second identical request while the first is still in flight is
+			// suppressed — including for NULL-generation legacy rows, where both
+			// tasks would otherwise validate against the same NULL snapshot.
+			const dup = memory.remember("stored text", { source: "test", extract: true });
+			expect(dup).toBe("leg8");
+			expect(calls).toBe(1);
+			gate.resolve();
+			await memory.flushExtractions();
+			expect(calls).toBe(1);
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
+		}
+	});
+
+	it("re-extraction refreshes a conflict fact's provenance without widening it", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope, channel_id) VALUES ('re1', 't', 'session-a', 'channel', 'chan-A')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "re1");
+			const before = beamA.db.query("SELECT channel_id, scope FROM facts WHERE source_msg_id = 're1'").get() as { channel_id: string | null; scope: string };
+			expect(before.channel_id).toBe("chan-A");
+			// The source moves to another channel; re-extraction hits the same
+			// stable fact id and must refresh the channel stamp...
+			beamA.db.run("UPDATE working_memory SET channel_id = 'chan-B' WHERE id = 're1'");
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "re1");
+			const after = beamA.db.query("SELECT channel_id, scope, session_id FROM facts WHERE source_msg_id = 're1'").get() as { channel_id: string | null; scope: string; session_id: string };
+			expect(after.channel_id).toBe("chan-B");
+			// ...while scope and owner stay untouched (no retroactive widening).
+			expect(after.scope).toBe(before.scope);
+			expect(after.session_id).toBe("session-a");
+			// Recall now follows the source's current channel...
+			const beamB = new BeamMemory({ sessionId: "session-b", dbPath });
+			try {
+				const inB = factRecall(beamB, "quorum relay", 30, "chan-B") as { content: string }[];
+				expect(inB.some(h => h.content.includes("quorum relay"))).toBe(true);
+				const inA = factRecall(beamB, "quorum relay", 30, "chan-A") as { content: string }[];
+				expect(inA.some(h => h.content.includes("quorum relay"))).toBe(false);
+			} finally {
+				beamB.close();
+			}
+		} finally {
+			beamA.close();
+		}
+	});
+
 	it("force-import replacing both tiers of a shared id purges the full artifact set", () => {
 		const dbPath = tempDb();
 		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
