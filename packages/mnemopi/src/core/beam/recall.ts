@@ -451,8 +451,11 @@ function factVisibilityWhere(beam: BeamMemoryState, tableAlias: string, channelI
 	const hasChannelColumn = factsHaveChannelColumn(beam);
 	// A fact extracted from a channel-scoped source stays recallable through
 	// that channel (the source memory was visible there); without the channel
-	// stamp it is visible only to its session or globally.
-	const channelClause = hasChannelColumn ? ` OR (${prefix}channel_id IS NOT NULL AND ${prefix}channel_id = ?)` : "";
+	// stamp it is visible only to its session or globally. The fallback is
+	// limited to facts that are themselves channel-scoped: a session-scoped
+	// fact whose source is later widened must not become channel-visible
+	// retroactively (no-retroactive-widening policy).
+	const channelClause = hasScopeColumn && hasChannelColumn ? ` OR (${prefix}scope = 'channel' AND ${prefix}channel_id IS NOT NULL AND ${prefix}channel_id = ?)` : "";
 	const scope = hasScopeColumn
 		? `(${prefix}session_id = ? OR ${prefix}scope = 'global'${channelClause})`
 		: `${prefix}session_id = ?`;

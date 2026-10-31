@@ -187,10 +187,12 @@ const MEMORIA_SOURCE_TABLES = [
  */
 function factTierPredicate(tiers: readonly string[]): string {
 	const parts: string[] = [];
-	// Working-tier membership includes the legacy NULL rows: beam extraction
-	// is working-driven, so pre-provenance facts almost always are too.
+	// Legacy NULL rows are ambiguous (written before provenance existed), so a
+	// collision replacement in EITHER tier retires them: leaving them after an
+	// episode replacement would keep the replaced episode's statement
+	// recallable, and beam extraction is working-driven anyway.
 	if (tiers.includes("working")) parts.push("(source_tier = 'working' OR source_tier IS NULL)");
-	if (tiers.includes("episodic")) parts.push("source_tier = 'episodic'");
+	if (tiers.includes("episodic")) parts.push("(source_tier = 'episodic' OR source_tier IS NULL)");
 	return parts.length > 0 ? parts.join(" OR ") : "1 = 0";
 }
 
@@ -852,41 +854,44 @@ export function updateWorking(
 	content: string | null = null,
 	importance: number | null = null,
 ): boolean {
-	const assignments: string[] = [];
-	const params: SQLQueryBindings[] = [];
+	const baseAssignments: string[] = [];
+	const baseParams: SQLQueryBindings[] = [];
 	if (content !== null) {
-		assignments.push("content = ?", "embed_text = NULL");
-		params.push(content);
+		baseAssignments.push("content = ?", "embed_text = NULL");
+		baseParams.push(content);
 	}
 	if (importance !== null) {
-		assignments.push("importance = ?");
-		params.push(importance);
+		baseAssignments.push("importance = ?");
+		baseParams.push(importance);
 	}
-	if (assignments.length === 0) return false;
-	// Capture the old content BEFORE the UPDATE: an actual content change is
-	// what invalidates the source's derived facts, and the post-update value
-	// would compare equal to the new one.
-	const oldContent = content !== null
-		? (beam.db
-				.prepare("SELECT content FROM working_memory WHERE id = ? AND session_id = ?")
-				.get(memoryId, beam.sessionId) as { content: string } | null)
-		: null;
-	const contentChanged = content !== null && oldContent != null && oldContent.content !== content;
-	if (contentChanged) {
-		// Advance the extraction generation on every real content change: a
-		// pending task bound to the old text must be discarded even when a
-		// later edit restores the identical content — the rowid, the created
-		// stamp, and the content itself all match again, and only a per-change
-		// token tells the incarnations apart.
-		assignments.push("generation = ?");
-		params.push(freshGeneration());
-	}
-	params.push(memoryId, beam.sessionId);
+	if (baseAssignments.length === 0) return false;
 	// The source update and the derivative cleanup must commit as one unit:
 	// an exit, a cleanup error, or a concurrent recall between an
 	// autocommitted UPDATE and a later purge would see the new content while
-	// the old (possibly global) facts still pass the live-source checks.
+	// the old (possibly global) facts still pass the live-source checks. The
+	// old-content read happens INSIDE the same transaction: a concurrent
+	// writer changing the row between the comparison and the UPDATE would
+	// otherwise masquerade as "no content change", skipping the generation
+	// rotation and the derivative cleanup.
 	const result = transaction(beam.db, () => {
+		const oldContent = content !== null
+			? (beam.db
+					.prepare("SELECT content FROM working_memory WHERE id = ? AND session_id = ?")
+					.get(memoryId, beam.sessionId) as { content: string } | null)
+			: null;
+		const contentChanged = content !== null && oldContent != null && oldContent.content !== content;
+		const assignments = [...baseAssignments];
+		const params = [...baseParams];
+		if (contentChanged) {
+			// Advance the extraction generation on every real content change: a
+			// pending task bound to the old text must be discarded even when a
+			// later edit restores the identical content — the rowid, the created
+			// stamp, and the content itself all match again, and only a
+			// per-change token tells the incarnations apart.
+			assignments.push("generation = ?");
+			params.push(freshGeneration());
+		}
+		params.push(memoryId, beam.sessionId);
 		const updated = beam.db.run(
 			`UPDATE working_memory SET ${assignments.join(", ")} WHERE id = ? AND session_id = ?`,
 			params,
@@ -918,7 +923,7 @@ export function updateWorking(
 	return result.changes > 0;
 }
 
-export function get(beam: BeamMemoryState, memoryId: string): Row | null {
+export function get(beam: BeamMemoryState, memoryId: string, channelId?: string | null): Row | null {
 	using workingStatement = beam.db.prepare(`
 		SELECT id, content, source, timestamp, session_id,
 			   importance, metadata_json, veracity, created_at, valid_until, superseded_by
@@ -937,7 +942,7 @@ export function get(beam: BeamMemoryState, memoryId: string): Row | null {
 	const episodic = episodicStatement.get(memoryId, beam.sessionId) as Row | null | undefined;
 	if (episodic != null) return { ...episodic, metadata: episodic.metadata_json, memory_store: "episodic" };
 
-	return getFact(beam, memoryId);
+	return getFact(beam, memoryId, channelId);
 }
 
 /**
@@ -956,8 +961,12 @@ function getFact(beam: BeamMemoryState, memoryId: string, channelId?: string | n
 	using statement = beam.db.prepare("SELECT * FROM facts WHERE fact_id = ?");
 	const fact = statement.get(memoryId) as Row | null | undefined;
 	if (fact == null) return null;
+	// Callers that surfaced a fact through a channel (factRecall / enhanced
+	// recall with a channelId) must be able to resolve it by id: default the
+	// context to the beam's own channel so a plain get() still works.
+	const effectiveChannel = channelId ?? beam.channelId ?? null;
 	const factChannel = typeof fact.channel_id === "string" ? fact.channel_id : null;
-	if (fact.session_id !== beam.sessionId && fact.scope !== "global" && (factChannel === null || factChannel !== channelId)) return null;
+	if (fact.session_id !== beam.sessionId && fact.scope !== "global" && (factChannel === null || factChannel !== effectiveChannel)) return null;
 	// Mirror factRecall's source rules (factVisibilityWhere in recall.ts): a
 	// fact retires with its source when the source is superseded or expired,
 	// and stops resolving when the source row is visible to fewer sessions
@@ -985,7 +994,7 @@ function getFact(beam: BeamMemoryState, memoryId: string, channelId?: string | n
 			if (source == null) continue;
 			if (source.superseded_by != null) return null;
 			if (source.valid_until != null && source.valid_until <= now) return null;
-			const sourceChannelOk = source.scope === "channel" && source.channel_id !== null && source.channel_id === channelId;
+			const sourceChannelOk = source.scope === "channel" && source.channel_id !== null && source.channel_id === effectiveChannel;
 			if (source.session_id !== beam.sessionId && source.scope !== "global" && !sourceChannelOk) return null;
 		}
 	}

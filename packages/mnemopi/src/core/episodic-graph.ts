@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { closeQuietly, type DatabasePath, openDatabase, transaction } from "../db";
-import { ensureFactsFtsUpdateTrigger, sourceTierOf } from "./facts-fts";
+import { ensureFactsFtsUpdateTrigger, sourceChannelOf, sourceTierOf } from "./facts-fts";
 
 export interface Gist {
 	readonly id: string;
@@ -469,7 +469,7 @@ export class EpisodicGraph {
 					timestamp = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.timestamp ELSE facts.timestamp END,
 					source_msg_id = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.source_msg_id ELSE facts.source_msg_id END,
 					confidence = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.confidence ELSE facts.confidence END`,
-			[fact.id, sessionId, fact.subject, fact.predicate, fact.object, fact.timestamp, memoryId, fact.confidence, scope, sourceTierOf(this.db, memoryId), null],
+			[fact.id, sessionId, fact.subject, fact.predicate, fact.object, fact.timestamp, memoryId, fact.confidence, scope, sourceTierOf(this.db, memoryId), sourceChannelOf(this.db, memoryId)],
 		);
 	}
 	getFact(id: string): Fact | null {

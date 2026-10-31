@@ -246,8 +246,8 @@ export class BeamMemory implements BeamMemoryState {
 		return updateWorking(this, memoryId, content, importance);
 	}
 
-	get(memoryId: string): unknown | null {
-		return get(this, memoryId);
+	get(memoryId: string, channelId?: string | null): unknown | null {
+		return get(this, memoryId, channelId);
 	}
 
 	forgetWorking(memoryId: string): boolean {

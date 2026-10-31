@@ -1314,8 +1314,9 @@ describe("E7 facts scope, review round 3", () => {
 
 	it("keeps the pending marker until every in-flight extraction settles", async () => {
 		let calls = 0;
-		let releaseGate: () => void = () => {};
-		const gate = new Promise<void>(resolve => (releaseGate = resolve));
+		let task2Done: () => void = () => {};
+		const task2DonePromise = new Promise<void>(resolve => (task2Done = resolve));
+		const gate = Promise.withResolvers<void>();
 		const memory = new Mnemopi({
 			sessionId: "session-a",
 			dbPath: tempDb(),
@@ -1323,7 +1324,8 @@ describe("E7 facts scope, review round 3", () => {
 				enabled: true,
 				complete: async () => {
 					calls++;
-					if (calls === 1) await gate;
+					if (calls === 1) await gate.promise;
+					if (calls === 2) task2Done();
 					return "I use the quorum relay for tokens";
 				},
 			},
@@ -1335,16 +1337,119 @@ describe("E7 facts scope, review round 3", () => {
 			// A re-scope schedules a replacement while the first task is still
 			// gated: two tasks in flight under one id.
 			memory.remember(storedText, { source: "test", scope: "session", extract: true });
-			// Let the fast task settle; the gated one is still in flight, so the
-			// pending marker must still be held (count, not set)...
-			await new Promise(resolve => setTimeout(resolve, 25));
+			// Deterministically wait for the fast task's LLM call to return, then
+			// drain microtasks until only the gated task is still counted — the
+			// marker must survive the first settle (count, not set).
+			await task2DonePromise;
+			for (let i = 0; i < 10_000 && (memory.beam.pendingExtractionIds.get(id) ?? 0) !== 1; i++) {
+				await Promise.resolve();
+			}
+			expect(memory.beam.pendingExtractionIds.get(id)).toBe(1);
 			memory.remember(storedText, { source: "test", extract: true });
-			releaseGate();
+			gate.resolve();
 			await memory.flushExtractions();
 			expect(calls).toBe(2);
 		} finally {
 			await memory.flushExtractions();
 			memory.close();
+		}
+	});
+
+	it("channel visibility does not retroactively widen session-scoped facts", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope, channel_id) VALUES ('ch5', 't', 'session-a', 'session', 'chan-5')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "ch5");
+			const row = beamA.db.query("SELECT scope, channel_id FROM facts WHERE source_msg_id = 'ch5'").get() as { scope: string; channel_id: string | null };
+			expect(row.scope).toBe("session");
+			expect(row.channel_id).toBe("chan-5");
+			// Widen the source later: the fact keeps its original scope and
+			// must not become channel-visible retroactively.
+			beamA.db.run("UPDATE working_memory SET scope = 'global' WHERE id = 'ch5'");
+			const beamB = new BeamMemory({ sessionId: "session-b", dbPath });
+			try {
+				const hits = factRecall(beamB, "quorum relay", 30, "chan-5") as { content: string }[];
+				expect(hits.some(h => h.content.includes("quorum relay"))).toBe(false);
+			} finally {
+				beamB.close();
+			}
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("graph-stored facts stamp the source channel", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			const graph = new EpisodicGraph({ db: beamA.db, dbPath });
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope, channel_id) VALUES ('ch6', 't', 'session-a', 'channel', 'chan-6')",
+			);
+			graph.storeFact(
+				{ id: "f-ch6", subject: "I", predicate: "use", object: "the quorum relay for tokens", timestamp: "2026-01-01T00:00:00.000Z", confidence: 0.7 },
+				"ch6",
+				"session-a",
+				"channel",
+			);
+			const row = beamA.db.query("SELECT channel_id, source_tier FROM facts WHERE fact_id = 'f-ch6'").get() as { channel_id: string | null; source_tier: string | null };
+			expect(row.channel_id).toBe("chan-6");
+			expect(row.source_tier).toBe("working");
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("get-by-id resolves a channel fact for a session in the channel", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope, channel_id) VALUES ('ch7', 't', 'session-a', 'channel', 'chan-7')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "ch7");
+			const factId = (beamA.db.query("SELECT fact_id FROM facts WHERE source_msg_id = 'ch7'").get() as { fact_id: string }).fact_id;
+			const beamB = new BeamMemory({ sessionId: "session-b", dbPath });
+			try {
+				expect(get(beamB, factId)).toBeNull();
+				expect(get(beamB, factId, "chan-7")).not.toBeNull();
+			} finally {
+				beamB.close();
+			}
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("legacy unprovenanced facts retire when the colliding episode is force-overwritten", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('leg7', 'working text', 'session-a', 'global')",
+			);
+			beamA.db.run(
+				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('leg7', 'old episode', 'session-a', 'global')",
+			);
+			// A pre-provenance fact: no source_tier value (NULL), so its true
+			// tier is unknown.
+			beamA.db.run(
+				"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence, scope) VALUES ('leg7-f', 'session-a', 'I', 'use', 'the quorum relay for tokens', '2026-01-01T00:00:00.000Z', 'leg7', 0.7, 'global')",
+			);
+			const stats = importFromDict(
+				beamA,
+				{ episodic_memory: [{ id: "leg7", content: "replacement episode", session_id: "session-a", scope: "global" }] },
+				true,
+			);
+			expect(stats.episodic_memory.overwritten).toBe(1);
+			// The legacy NULL-tier fact is ambiguous, so the colliding episode
+			// replacement retires it conservatively.
+			expect((beamA.db.query("SELECT fact_id FROM facts WHERE source_msg_id = 'leg7'").all() as unknown[]).length).toBe(0);
+		} finally {
+			beamA.close();
 		}
 	});
 
