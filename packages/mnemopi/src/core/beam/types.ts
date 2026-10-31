@@ -106,8 +106,8 @@ export interface BeamMemoryState {
 	config: BeamConfig;
 	/** Tracks in-flight background fact-extraction tasks scheduled by `remember(..., { extract: true })`. */
 	pendingExtractions?: Set<Promise<void>>;
-	/** Memory ids with an extraction task still in flight. */
-	pendingExtractionIds?: Set<string>;
+	/** Per-id count of extraction tasks still in flight. */
+	pendingExtractionIds?: Map<string, number>;
 }
 
 export interface AnnotationWriteOptions {

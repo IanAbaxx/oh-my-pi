@@ -433,8 +433,16 @@ function scheduleFactExtraction(beam: BeamMemoryState, memoryId: string, content
 		void task.finally(() => pending.delete(task));
 	}
 	if (pendingIds !== undefined) {
-		pendingIds.add(memoryId);
-		void task.finally(() => pendingIds.delete(memoryId));
+		// A replacement scheduled while an older task for the same row is still
+		// in flight shares the id: count in-flight tasks and clear the marker
+		// only after the last one settles, so duplicate remembers in between
+		// stay suppressed.
+		pendingIds.set(memoryId, (pendingIds.get(memoryId) ?? 0) + 1);
+		void task.finally(() => {
+			const remaining = (pendingIds.get(memoryId) ?? 1) - 1;
+			if (remaining <= 0) pendingIds.delete(memoryId);
+			else pendingIds.set(memoryId, remaining);
+		});
 	}
 }
 
@@ -944,25 +952,26 @@ export function get(beam: BeamMemoryState, memoryId: string): Row | null {
  * `memory_store: "fact"` marks it read-only — no update/forget/invalidate
  * path mutates `facts`.
  */
-function getFact(beam: BeamMemoryState, memoryId: string): Row | null {
+function getFact(beam: BeamMemoryState, memoryId: string, channelId?: string | null): Row | null {
 	using statement = beam.db.prepare("SELECT * FROM facts WHERE fact_id = ?");
 	const fact = statement.get(memoryId) as Row | null | undefined;
 	if (fact == null) return null;
-	if (fact.session_id !== beam.sessionId && fact.scope !== "global") return null;
+	const factChannel = typeof fact.channel_id === "string" ? fact.channel_id : null;
+	if (fact.session_id !== beam.sessionId && fact.scope !== "global" && (factChannel === null || factChannel !== channelId)) return null;
 	// Mirror factRecall's source rules (factVisibilityWhere in recall.ts): a
 	// fact retires with its source when the source is superseded or expired,
 	// and stops resolving when the source row is visible to fewer sessions
 	// than the fact — otherwise get-by-id is a back door around factRecall.
 	const sourceId = typeof fact.source_msg_id === "string" ? fact.source_msg_id : "";
 	if (sourceId.length > 0) {
-		type SourceRow = { superseded_by: string | null; valid_until: string | null; session_id: string | null; scope: string | null };
+		type SourceRow = { superseded_by: string | null; valid_until: string | null; session_id: string | null; scope: string | null; channel_id: string | null };
 		// bun:sqlite get() returns null (not undefined) for a missing row.
 		// The tiers' primary keys are independent, so the same id can exist in
 		// both; probe both conservatively (mirrors factVisibilityWhere) — a
 		// visible row in one tier must not mask a retired or private row in
 		// the other.
-		const wmSource = beam.db.prepare("SELECT superseded_by, valid_until, session_id, scope FROM working_memory WHERE id = ?").get(sourceId) as SourceRow | null;
-		const epSource = beam.db.prepare("SELECT superseded_by, valid_until, session_id, scope FROM episodic_memory WHERE id = ?").get(sourceId) as SourceRow | null;
+		const wmSource = beam.db.prepare("SELECT superseded_by, valid_until, session_id, scope, channel_id FROM working_memory WHERE id = ?").get(sourceId) as SourceRow | null;
+		const epSource = beam.db.prepare("SELECT superseded_by, valid_until, session_id, scope, channel_id FROM episodic_memory WHERE id = ?").get(sourceId) as SourceRow | null;
 		const now = toUtcIso(new Date());
 		// Follow the recorded provenance tier: a working-derived fact is judged
 		// by the working row alone and an episode-derived fact by the episode
@@ -976,7 +985,8 @@ function getFact(beam: BeamMemoryState, memoryId: string): Row | null {
 			if (source == null) continue;
 			if (source.superseded_by != null) return null;
 			if (source.valid_until != null && source.valid_until <= now) return null;
-			if (source.session_id !== beam.sessionId && source.scope !== "global") return null;
+			const sourceChannelOk = source.scope === "channel" && source.channel_id !== null && source.channel_id === channelId;
+			if (source.session_id !== beam.sessionId && source.scope !== "global" && !sourceChannelOk) return null;
 		}
 	}
 	const subject = typeof fact.subject === "string" ? fact.subject : "";
@@ -1115,6 +1125,27 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 	const episodicRowid = db.query("SELECT rowid FROM episodic_memory WHERE id = ?");
 	const scratchExists = db.query("SELECT 1 FROM scratchpad WHERE id = ?");
 	const vecEpisodesAvailable = vecAvailable(db);
+	// Force imports that replace BOTH tiers of a shared id at once: neither old
+	// source survives, so the shared untyped artifacts die with them (the
+	// episode branch runs the single full purge; the working branch defers).
+	const workingPayloadIds = new Set<string>();
+	const episodicPayloadIds = new Set<string>();
+	for (const raw of Array.isArray(data.working_memory) ? data.working_memory : []) {
+		const id = String(jsonObject(raw).id ?? "");
+		if (id.length > 0) workingPayloadIds.add(id);
+	}
+	for (const raw of Array.isArray(data.episodic_memory) ? data.episodic_memory : []) {
+		const id = String(jsonObject(raw).id ?? "");
+		if (id.length > 0) episodicPayloadIds.add(id);
+	}
+	const bothTiersReplaced = new Set<string>();
+	if (force) {
+		for (const id of workingPayloadIds) {
+			if (episodicPayloadIds.has(id) && workingExists.get(id) !== null && episodicExists.get(id) !== null) {
+				bothTiersReplaced.add(id);
+			}
+		}
+	}
 	transaction(db, () => {
 		for (const raw of Array.isArray(data.working_memory) ? data.working_memory : []) {
 			const item = jsonObject(raw);
@@ -1127,13 +1158,17 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 			}
 			if (exists) {
 				db.run("DELETE FROM working_memory WHERE id = ?", [id]);
-				// Mirror of the episode branch: with a same-id episode row the
-				// untyped id is ambiguous, so retire only the working tier's
-				// derivatives (working, plus the legacy NULL rows).
-				const episodeCollision = episodicExists.get(id) !== null;
-				purgeWorkingMemoryArtifacts(db, [id], {
-					factTiers: episodeCollision ? ["working"] : undefined,
-				});
+				if (!bothTiersReplaced.has(id)) {
+					// Mirror of the episode branch: with a same-id episode row
+					// the untyped id is ambiguous, so retire only the working
+					// tier's derivatives (working, plus the legacy NULL rows). A
+					// both-tier replacement defers to the episode branch's full
+					// purge.
+					const episodeCollision = episodicExists.get(id) !== null;
+					purgeWorkingMemoryArtifacts(db, [id], {
+						factTiers: episodeCollision ? ["working"] : undefined,
+					});
+				}
 				stats.working_memory.overwritten++;
 			} else {
 				stats.working_memory.inserted++;
@@ -1201,14 +1236,24 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 				// A force overwrite replaces the episode's content entirely:
 				// cascade the old row's fact / graph / annotation artifacts so
 				// the replacement cannot keep derivatives of the overwritten
-				// text (mirrors the working-memory branch above). Derivative
-				// rows are keyed only by the untyped id, so when a working row
-				// with the same id exists, provenance retires only the episode's
-				// own fact derivatives and leaves the working row's intact.
-				const workingCollision = workingExists.get(id) !== null;
-				purgeWorkingMemoryArtifacts(db, [id], {
-					factTiers: workingCollision ? ["episodic"] : undefined,
-				});
+				// text (mirrors the working-memory branch above).
+				if (bothTiersReplaced.has(id)) {
+					// Both old tiers were replaced at once: the shared, untyped
+					// artifacts (facts from both tiers, annotations, embeddings,
+					// projections, gists, raw-memory edges) belong to the old
+					// content and die with it — one full purge, not two
+					// tier-scoped ones that would leave them behind.
+					purgeWorkingMemoryArtifacts(db, [id]);
+				} else {
+					// Derivative rows are keyed only by the untyped id, so when a
+					// working row with the same id exists, provenance retires only
+					// the episode's own fact derivatives and leaves the working
+					// row's intact.
+					const workingCollision = workingExists.get(id) !== null;
+					purgeWorkingMemoryArtifacts(db, [id], {
+						factTiers: workingCollision ? ["episodic"] : undefined,
+					});
+				}
 				stats.episodic_memory.overwritten++;
 			} else {
 				stats.episodic_memory.inserted++;

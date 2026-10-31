@@ -1286,4 +1286,103 @@ describe("E7 facts scope, review round 3", () => {
 			beamA.close();
 		}
 	});
+
+	it("extracted facts carry their source channel for cross-session visibility", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope, channel_id) VALUES ('ch1', 'channel text', 'session-a', 'channel', 'chan-1')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "ch1");
+			const row = beamA.db.query("SELECT channel_id FROM facts WHERE source_msg_id = 'ch1'").get() as { channel_id: string | null };
+			expect(row.channel_id).toBe("chan-1");
+			// A different session in the same channel recalls the fact...
+			const beamB = new BeamMemory({ sessionId: "session-b", dbPath });
+			try {
+				const withChannel = factRecall(beamB, "quorum relay", 30, "chan-1") as { content: string }[];
+				expect(withChannel.some(h => h.content.includes("quorum relay"))).toBe(true);
+				const withoutChannel = factRecall(beamB, "quorum relay", 30) as { content: string }[];
+				expect(withoutChannel.some(h => h.content.includes("quorum relay"))).toBe(false);
+			} finally {
+				beamB.close();
+			}
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("keeps the pending marker until every in-flight extraction settles", async () => {
+		let calls = 0;
+		let releaseGate: () => void = () => {};
+		const gate = new Promise<void>(resolve => (releaseGate = resolve));
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath: tempDb(),
+			llm: {
+				enabled: true,
+				complete: async () => {
+					calls++;
+					if (calls === 1) await gate;
+					return "I use the quorum relay for tokens";
+				},
+			},
+		});
+		try {
+			const storedText = "stored text";
+			const id = memory.remember(storedText, { source: "test", scope: "global", extract: true });
+			expect(id).toBeTruthy();
+			// A re-scope schedules a replacement while the first task is still
+			// gated: two tasks in flight under one id.
+			memory.remember(storedText, { source: "test", scope: "session", extract: true });
+			// Let the fast task settle; the gated one is still in flight, so the
+			// pending marker must still be held (count, not set)...
+			await new Promise(resolve => setTimeout(resolve, 25));
+			memory.remember(storedText, { source: "test", extract: true });
+			releaseGate();
+			await memory.flushExtractions();
+			expect(calls).toBe(2);
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
+		}
+	});
+
+	it("force-import replacing both tiers of a shared id purges the full artifact set", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('b9', 'old working', 'session-a', 'global')",
+			);
+			beamA.db.run(
+				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('b9', 'old episode', 'session-a', 'global')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "b9");
+			beamA.db.run("INSERT INTO gists (id, text, memory_id) VALUES ('gist_b9', 'old gist', 'b9')");
+			beamA.db.run(
+				"INSERT INTO graph_edges (source, target, edge_type, weight, timestamp) VALUES ('b9', 'node-b9', 'ctx', 1, '2026-01-01T00:00:00.000Z')",
+			);
+			const stats = importFromDict(
+				beamA,
+				{
+					working_memory: [{ id: "b9", content: "new working", session_id: "session-a", scope: "global" }],
+					episodic_memory: [{ id: "b9", content: "new episode", session_id: "session-a", scope: "global" }],
+				},
+				true,
+			);
+			expect(stats.working_memory.overwritten).toBe(1);
+			expect(stats.episodic_memory.overwritten).toBe(1);
+			// Neither old source survives: the shared untyped artifacts (facts,
+			// gists, raw-memory edges) die with them in one full purge.
+			expect((beamA.db.query("SELECT fact_id FROM facts WHERE source_msg_id = 'b9'").all() as unknown[]).length).toBe(0);
+			expect((beamA.db.query("SELECT id FROM gists WHERE memory_id = 'b9'").all() as unknown[]).length).toBe(0);
+			expect((beamA.db.query("SELECT source FROM graph_edges WHERE source = 'b9' OR target = 'node-b9'").all() as unknown[]).length).toBe(0);
+			// ...while the replacement rows are live.
+			expect((beamA.db.query("SELECT content FROM working_memory WHERE id = 'b9'").get() as { content: string }).content).toBe("new working");
+			expect((beamA.db.query("SELECT content FROM episodic_memory WHERE id = 'b9'").get() as { content: string }).content).toBe("new episode");
+		} finally {
+			beamA.close();
+		}
+	});
 });

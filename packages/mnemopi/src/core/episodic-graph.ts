@@ -338,6 +338,7 @@ export class EpisodicGraph {
 				session_id TEXT DEFAULT 'default',
 				scope TEXT DEFAULT 'session',
 				source_tier TEXT DEFAULT NULL,
+				channel_id TEXT DEFAULT NULL,
 				subject TEXT NOT NULL,
 				predicate TEXT NOT NULL,
 				object TEXT NOT NULL,
@@ -356,6 +357,9 @@ export class EpisodicGraph {
 		// Same idempotent adoption for the provenance column on older banks.
 		if (!factColumns.some(column => column.name === "source_tier")) {
 			this.db.run("ALTER TABLE facts ADD COLUMN source_tier TEXT DEFAULT NULL");
+		}
+		if (!factColumns.some(column => column.name === "channel_id")) {
+			this.db.run("ALTER TABLE facts ADD COLUMN channel_id TEXT DEFAULT NULL");
 		}
 		// Banks opened directly through this store (without BeamMemory/initBeam)
 		// may have an fts_facts index with only insert/delete triggers; install
@@ -450,8 +454,8 @@ export class EpisodicGraph {
 		// must not transfer ownership (and visibility) of a private fact.
 		this.db.run(
 			`INSERT INTO facts
-				(fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence, scope, source_tier)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				(fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence, scope, source_tier, channel_id)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(fact_id) DO UPDATE SET
 					session_id = CASE
 						WHEN facts.scope = 'global' THEN excluded.session_id
@@ -465,7 +469,7 @@ export class EpisodicGraph {
 					timestamp = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.timestamp ELSE facts.timestamp END,
 					source_msg_id = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.source_msg_id ELSE facts.source_msg_id END,
 					confidence = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.confidence ELSE facts.confidence END`,
-			[fact.id, sessionId, fact.subject, fact.predicate, fact.object, fact.timestamp, memoryId, fact.confidence, scope, sourceTierOf(this.db, memoryId)],
+			[fact.id, sessionId, fact.subject, fact.predicate, fact.object, fact.timestamp, memoryId, fact.confidence, scope, sourceTierOf(this.db, memoryId), null],
 		);
 	}
 	getFact(id: string): Fact | null {

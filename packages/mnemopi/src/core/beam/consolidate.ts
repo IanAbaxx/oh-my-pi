@@ -7,7 +7,7 @@ import { REGEX_EXTRACTION_MAX_INPUT_CHARS } from "../entities";
 import { EpisodicGraph } from "../episodic-graph";
 import { type ExtractedFactCategories, heuristicExtractFacts } from "../extraction";
 import { clampVeracity, VERACITY_WEIGHTS, type Veracity, VeracityConsolidator } from "../veracity-consolidation";
-import { sourceTierOf } from "../facts-fts";
+import { sourceChannelOf, sourceTierOf } from "../facts-fts";
 import { sourceMemoryScope } from "./fact-scope";
 import { scheduleEmbedding } from "./helpers";
 import type { BeamMemoryState, BeamStats, JsonValue, MemoriaRetrieveResult, Metadata, SleepResult } from "./types";
@@ -293,9 +293,9 @@ function insertFactRows(
 	// default (no retroactive widening).
 	beam.db.run(
 		`INSERT OR IGNORE INTO facts
-		 (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence, scope, source_tier)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[factId, sourceSession(beam), key, factType, value, timestamp, sourceMemoryId, importance, scope, sourceTierOf(beam.db, sourceMemoryId)],
+		 (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence, scope, source_tier, channel_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		[factId, sourceSession(beam), key, factType, value, timestamp, sourceMemoryId, importance, scope, sourceTierOf(beam.db, sourceMemoryId), sourceChannelOf(beam.db, sourceMemoryId)],
 	);
 }
 

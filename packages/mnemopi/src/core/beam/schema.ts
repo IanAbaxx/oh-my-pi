@@ -355,6 +355,7 @@ export function initBeam(db: Database): void {
 			session_id TEXT NOT NULL,
 			scope TEXT DEFAULT 'session',
 			source_tier TEXT DEFAULT NULL,
+			channel_id TEXT DEFAULT NULL,
 			subject TEXT NOT NULL,
 			predicate TEXT NOT NULL,
 			object TEXT NOT NULL,
@@ -378,6 +379,10 @@ export function initBeam(db: Database): void {
 	// collisions across tiers) uses it to retire one tier's derivatives without
 	// destroying the other tier's.
 	addColumnIfMissing(db, "facts", "source_tier", "TEXT DEFAULT NULL");
+	// The source row's channel, so channel-scoped facts stay recallable through
+	// their channel (the memory itself was, but the fact only carried the
+	// writing session before).
+	addColumnIfMissing(db, "facts", "channel_id", "TEXT DEFAULT NULL");
 	db.run(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(
 			subject, predicate, object, content='facts'

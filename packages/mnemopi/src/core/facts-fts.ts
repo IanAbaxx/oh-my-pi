@@ -31,6 +31,30 @@ export const factsFtsUpdateTriggerSql = [
  * provenance so tier-scoped cleanup (id collisions) can retire one tier's
  * derivatives without touching the other tier's.
  */
+/**
+ * The channel id recorded on a fact source row (working checked first, same
+ * order as provenance) — persisted on extracted facts so channel-scoped
+ * sources stay recallable through their channel, not only through the
+ * session that wrote them. NULL for standalone graph banks and for sources
+ * without a channel.
+ */
+export function sourceChannelOf(db: Database, sourceMemoryId: string | null): string | null {
+	if (sourceMemoryId == null || sourceMemoryId === "") return null;
+	try {
+		const working = db.prepare("SELECT channel_id FROM working_memory WHERE id = ?").get(sourceMemoryId) as { channel_id: string | null } | null;
+		if (working !== null) {
+			return typeof working.channel_id === "string" && working.channel_id !== "" ? working.channel_id : null;
+		}
+		const episode = db.prepare("SELECT channel_id FROM episodic_memory WHERE id = ?").get(sourceMemoryId) as { channel_id: string | null } | null;
+		if (episode !== null) {
+			return typeof episode.channel_id === "string" && episode.channel_id !== "" ? episode.channel_id : null;
+		}
+	} catch {
+		return null;
+	}
+	return null;
+}
+
 function tierTableHas(db: Database, table: string, id: string): boolean {
 	try {
 		return db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id) !== null;
