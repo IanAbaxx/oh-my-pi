@@ -435,16 +435,24 @@ function scheduleFactExtraction(beam: BeamMemoryState, memoryId: string, content
 		void task.finally(() => pending.delete(task));
 	}
 	if (pendingIds !== undefined) {
-		// A replacement scheduled while an older task for the same row is still
-		// in flight shares the id: count in-flight tasks and clear the marker
-		// only after the last one settles, so duplicate remembers in between
-		// stay suppressed.
-		pendingIds.set(memoryId, (pendingIds.get(memoryId) ?? 0) + 1);
-		void task.finally(() => {
-			const remaining = (pendingIds.get(memoryId) ?? 1) - 1;
-			if (remaining <= 0) pendingIds.delete(memoryId);
-			else pendingIds.set(memoryId, remaining);
-		});
+		// Keyed by id AND the snapshot's generation: a task bound to an older
+		// generation is guaranteed to fail validation, so it must not count as
+		// "pending" for suppression purposes (an explicit extraction request
+		// for the current content would otherwise be dropped and the edited
+		// memory left without facts). A null snapshot (source already gone)
+		// likewise never matches a live row.
+		if (scheduled !== null) {
+			const key = memoryId + "\0" + scheduled.generation;
+			// A replacement scheduled while an older task for the same row is
+			// still in flight counts separately; the entry clears only after
+			// the last task for that (id, generation) settles.
+			pendingIds.set(key, (pendingIds.get(key) ?? 0) + 1);
+			void task.finally(() => {
+				const remaining = (pendingIds.get(key) ?? 1) - 1;
+				if (remaining <= 0) pendingIds.delete(key);
+				else pendingIds.set(key, remaining);
+			});
+		}
 	}
 }
 
@@ -622,7 +630,14 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		// generation rotated above kills the old task. Only a genuinely pending
 		// task is suppressed — re-requesting identical content while the
 		// extraction is still in flight would double-run the LLM.
-		const pendingHere = beam.pendingExtractionIds?.has(existingId) ?? false;
+		// Suppression only counts a task pending for the CURRENT generation:
+		// the row's token after the refresh above (rotated on a real scope
+		// change, unchanged otherwise). An older-generation task will discard
+		// itself and must not block this request.
+		const currentGeneration = scopeChanged ? null : (storedScope?.generation ?? null);
+		const pendingHere =
+			currentGeneration !== null &&
+			(beam.pendingExtractionIds?.has(existingId + "\0" + currentGeneration) ?? false);
 		if (options.extract === true && (scopeChanged || !pendingHere)) {
 			scheduleFactExtraction(beam, existingId, options.extractText ?? options.extract_text ?? content);
 		}
@@ -966,7 +981,12 @@ function getFact(beam: BeamMemoryState, memoryId: string, channelId?: string | n
 	// context to the beam's own channel so a plain get() still works.
 	const effectiveChannel = channelId ?? beam.channelId ?? null;
 	const factChannel = typeof fact.channel_id === "string" ? fact.channel_id : null;
-	if (fact.session_id !== beam.sessionId && fact.scope !== "global" && (factChannel === null || factChannel !== effectiveChannel)) return null;
+	// The channel match admits the caller only for facts that are themselves
+	// channel-scoped — the same no-retroactive-widening guard factRecall
+	// applies: a session-scoped fact whose source was later widened must stay
+	// private to its session.
+	const factChannelOk = fact.scope === "channel" && factChannel !== null && factChannel === effectiveChannel;
+	if (fact.session_id !== beam.sessionId && fact.scope !== "global" && !factChannelOk) return null;
 	// Mirror factRecall's source rules (factVisibilityWhere in recall.ts): a
 	// fact retires with its source when the source is superseded or expired,
 	// and stops resolving when the source row is visible to fewer sessions
@@ -1139,6 +1159,11 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 	// episode branch runs the single full purge; the working branch defers).
 	const workingPayloadIds = new Set<string>();
 	const episodicPayloadIds = new Set<string>();
+	// Ids whose working row is NEW (inserted by this payload), not pre-existing:
+	// when such an insertion collides with a force-replaced episode, the
+	// inserted row owns none of the old artifacts, so the episode branch must
+	// run the full purge (it cannot be a tier-scoped collision).
+	const workingInsertedIds = new Set<string>();
 	for (const raw of Array.isArray(data.working_memory) ? data.working_memory : []) {
 		const id = String(jsonObject(raw).id ?? "");
 		if (id.length > 0) workingPayloadIds.add(id);
@@ -1180,6 +1205,7 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 				}
 				stats.working_memory.overwritten++;
 			} else {
+				workingInsertedIds.add(id);
 				stats.working_memory.inserted++;
 			}
 			db.run(
@@ -1246,18 +1272,21 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 				// cascade the old row's fact / graph / annotation artifacts so
 				// the replacement cannot keep derivatives of the overwritten
 				// text (mirrors the working-memory branch above).
-				if (bothTiersReplaced.has(id)) {
-					// Both old tiers were replaced at once: the shared, untyped
-					// artifacts (facts from both tiers, annotations, embeddings,
-					// projections, gists, raw-memory edges) belong to the old
-					// content and die with it — one full purge, not two
-					// tier-scoped ones that would leave them behind.
+				const collisionByInsert = workingExists.get(id) !== null && workingInsertedIds.has(id);
+				if (bothTiersReplaced.has(id) || collisionByInsert) {
+					// Both old tiers were replaced at once (or the colliding
+					// working row was itself inserted by this import and owns none
+					// of the old artifacts): the shared, untyped artifacts — facts
+					// from both tiers, annotations, embeddings, projections, gists,
+					// raw-memory edges — belong to the old content and die with it.
+					// One full purge, not a tier-scoped one that would leave them
+					// behind.
 					purgeWorkingMemoryArtifacts(db, [id]);
 				} else {
 					// Derivative rows are keyed only by the untyped id, so when a
-					// working row with the same id exists, provenance retires only
-					// the episode's own fact derivatives and leaves the working
-					// row's intact.
+					// PRE-EXISTING working row with the same id exists, provenance
+					// retires only the episode's own fact derivatives and leaves
+					// the working row's intact.
 					const workingCollision = workingExists.get(id) !== null;
 					purgeWorkingMemoryArtifacts(db, [id], {
 						factTiers: workingCollision ? ["episodic"] : undefined,

@@ -1312,11 +1312,10 @@ describe("E7 facts scope, review round 3", () => {
 		}
 	});
 
-	it("keeps the pending marker until every in-flight extraction settles", async () => {
+	it("suppresses duplicate extraction only while the current generation is pending", async () => {
 		let calls = 0;
-		let task2Done: () => void = () => {};
-		const task2DonePromise = new Promise<void>(resolve => (task2Done = resolve));
-		const gate = Promise.withResolvers<void>();
+		const gate1 = Promise.withResolvers<void>();
+		const gate2 = Promise.withResolvers<void>();
 		const memory = new Mnemopi({
 			sessionId: "session-a",
 			dbPath: tempDb(),
@@ -1324,8 +1323,8 @@ describe("E7 facts scope, review round 3", () => {
 				enabled: true,
 				complete: async () => {
 					calls++;
-					if (calls === 1) await gate.promise;
-					if (calls === 2) task2Done();
+					if (calls === 1) await gate1.promise;
+					if (calls === 2) await gate2.promise;
 					return "I use the quorum relay for tokens";
 				},
 			},
@@ -1334,21 +1333,28 @@ describe("E7 facts scope, review round 3", () => {
 			const storedText = "stored text";
 			const id = memory.remember(storedText, { source: "test", scope: "global", extract: true });
 			expect(id).toBeTruthy();
-			// A re-scope schedules a replacement while the first task is still
-			// gated: two tasks in flight under one id.
+			// A re-scope rotates the generation and schedules a replacement while
+			// the first task is still gated: two distinct (id, generation) tasks.
 			memory.remember(storedText, { source: "test", scope: "session", extract: true });
-			// Deterministically wait for the fast task's LLM call to return, then
-			// drain microtasks until only the gated task is still counted — the
-			// marker must survive the first settle (count, not set).
-			await task2DonePromise;
-			for (let i = 0; i < 10_000 && (memory.beam.pendingExtractionIds.get(id) ?? 0) !== 1; i++) {
+			for (let i = 0; i < 10_000 && memory.beam.pendingExtractionIds.size !== 2; i++) {
 				await Promise.resolve();
 			}
-			expect(memory.beam.pendingExtractionIds.get(id)).toBe(1);
-			memory.remember(storedText, { source: "test", extract: true });
-			gate.resolve();
+			expect(memory.beam.pendingExtractionIds.size).toBe(2);
+			// A duplicate request at the CURRENT generation is suppressed...
+			const dup = memory.remember(storedText, { source: "test", extract: true });
+			expect(dup).toBe(id);
+			expect(calls).toBe(2);
+			// ...while a stale-generation task does NOT block: let the current
+			// task settle, then the obsolete one still counts nothing for the
+			// current generation, so the next explicit request runs.
+			gate2.resolve();
+			gate1.resolve();
 			await memory.flushExtractions();
 			expect(calls).toBe(2);
+			memory.remember(storedText, { source: "test", extract: true });
+			await memory.flushExtractions();
+			expect(calls).toBe(3);
+			expect((memory.conn.query("SELECT fact_id FROM facts WHERE source_msg_id = ?").all(id) as unknown[]).length).toBeGreaterThan(0);
 		} finally {
 			await memory.flushExtractions();
 			memory.close();

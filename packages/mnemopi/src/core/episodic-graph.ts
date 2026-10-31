@@ -468,6 +468,12 @@ export class EpisodicGraph {
 					object = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.object ELSE facts.object END,
 					timestamp = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.timestamp ELSE facts.timestamp END,
 					source_msg_id = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.source_msg_id ELSE facts.source_msg_id END,
+					-- Provenance follows the source id: a re-store from a
+					-- different source must not keep the old source's tier or
+					-- channel stamp, or visibility would trust a source the fact
+					-- no longer has.
+					source_tier = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.source_tier ELSE facts.source_tier END,
+					channel_id = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.channel_id ELSE facts.channel_id END,
 					confidence = CASE WHEN facts.scope = 'global' OR facts.session_id = excluded.session_id THEN excluded.confidence ELSE facts.confidence END`,
 			[fact.id, sessionId, fact.subject, fact.predicate, fact.object, fact.timestamp, memoryId, fact.confidence, scope, sourceTierOf(this.db, memoryId), sourceChannelOf(this.db, memoryId)],
 		);

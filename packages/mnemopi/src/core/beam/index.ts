@@ -291,8 +291,8 @@ export class BeamMemory implements BeamMemoryState {
 		return formatContext(this, results, format);
 	}
 
-	factRecall(query: string, topK = 30): RecallResult[] {
-		return factRecall(this, query, topK);
+	factRecall(query: string, topK = 30, channelId?: string | null): RecallResult[] {
+		return factRecall(this, query, topK, channelId ?? this.channelId ?? null);
 	}
 
 	getEpisodicStats(
