@@ -354,6 +354,7 @@ export function initBeam(db: Database): void {
 			fact_id TEXT PRIMARY KEY,
 			session_id TEXT NOT NULL,
 			scope TEXT DEFAULT 'session',
+			source_tier TEXT DEFAULT NULL,
 			subject TEXT NOT NULL,
 			predicate TEXT NOT NULL,
 			object TEXT NOT NULL,
@@ -372,6 +373,11 @@ export function initBeam(db: Database): void {
 	// recall.ts) already probes for it. Pre-existing rows keep the 'session'
 	// default — no retroactive widening to 'global'.
 	addColumnIfMissing(db, "facts", "scope", "TEXT DEFAULT 'session'");
+	// Fact provenance: which tier (working/episodic) the source memory lived in
+	// when the fact was written. Legacy rows keep NULL; tier-scoped cleanup (id
+	// collisions across tiers) uses it to retire one tier's derivatives without
+	// destroying the other tier's.
+	addColumnIfMissing(db, "facts", "source_tier", "TEXT DEFAULT NULL");
 	db.run(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(
 			subject, predicate, object, content='facts'

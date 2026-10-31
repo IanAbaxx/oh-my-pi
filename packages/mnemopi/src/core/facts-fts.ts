@@ -25,6 +25,29 @@ export const factsFtsUpdateTriggerSql = [
 ].join("\n");
 
 /**
+ * The memory tier that owns a fact source id — working is checked first,
+ * the same order as scope inheritance — or NULL when the id lives in no
+ * tier (fixtures, orphaned references). Persisted on fact rows as
+ * provenance so tier-scoped cleanup (id collisions) can retire one tier's
+ * derivatives without touching the other tier's.
+ */
+function tierTableHas(db: Database, table: string, id: string): boolean {
+	try {
+		return db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id) !== null;
+	} catch {
+		// Standalone graph banks carry no memory tier tables.
+		return false;
+	}
+}
+
+export function sourceTierOf(db: Database, sourceMemoryId: string | null): string | null {
+	if (sourceMemoryId == null || sourceMemoryId === "") return null;
+	if (tierTableHas(db, "working_memory", sourceMemoryId)) return "working";
+	if (tierTableHas(db, "episodic_memory", sourceMemoryId)) return "episodic";
+	return null;
+}
+
+/**
  * Install the FTS update trigger when the bank has an fts_facts index. An
  * external-content index only reflects rows written while the trigger was
  * active, so whenever the trigger is being enabled for the first time on this

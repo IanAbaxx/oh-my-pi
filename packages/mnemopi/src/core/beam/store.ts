@@ -185,38 +185,55 @@ const MEMORIA_SOURCE_TABLES = [
  * `EpisodicGraph` has initialised, so they are guarded. Callers own the
  * transaction and the base `working_memory` delete.
  */
+function factTierPredicate(tiers: readonly string[]): string {
+	const parts: string[] = [];
+	// Working-tier membership includes the legacy NULL rows: beam extraction
+	// is working-driven, so pre-provenance facts almost always are too.
+	if (tiers.includes("working")) parts.push("(source_tier = 'working' OR source_tier IS NULL)");
+	if (tiers.includes("episodic")) parts.push("source_tier = 'episodic'");
+	return parts.length > 0 ? parts.join(" OR ") : "1 = 0";
+}
+
 function purgeWorkingMemoryArtifacts(
 	db: BeamMemoryState["db"],
 	ids: readonly string[],
-	options: { preserveAnnotations?: boolean } = {},
+	options: { preserveAnnotations?: boolean; factTiers?: readonly ("working" | "episodic")[] } = {},
 ): void {
 	if (ids.length === 0) return;
 	const placeholders = ids.map(() => "?").join(", ");
+	// When factTiers is set (an id collision across tiers) only that tier's
+	// fact derivatives and their edges are retired; the shared projections
+	// (memoria, embeddings, annotations, gists) carry no provenance and are
+	// left untouched.
+	const tierFilter = options.factTiers === undefined ? "" : ` AND ${factTierPredicate(options.factTiers)}`;
 
 	const graphRefs = new Set<string>(ids);
 	for (const id of ids) graphRefs.add(`gist_${id}`);
 	if (tableExists(db, "facts")) {
-		using factStatement = db.prepare(`SELECT fact_id FROM facts WHERE source_msg_id IN (${placeholders})`);
+		using factStatement = db.prepare(`SELECT fact_id FROM facts WHERE source_msg_id IN (${placeholders})${tierFilter}`);
 		const factRows = factStatement.all(...ids) as {
 			fact_id: string;
 		}[];
 		for (const row of factRows) graphRefs.add(row.fact_id);
-		db.run(`DELETE FROM facts WHERE source_msg_id IN (${placeholders})`, [...ids]);
+		db.run(`DELETE FROM facts WHERE source_msg_id IN (${placeholders})${tierFilter}`, [...ids]);
 	}
 
-	// Content edits reuse this helper but must keep the source's annotations:
-	// they describe the memory itself (occurred_on, has_source, caller-added
-	// metadata) and survive a rewording, so the edit path opts out here.
-	if (!options.preserveAnnotations) {
-		db.run(`DELETE FROM annotations WHERE memory_id IN (${placeholders})`, [...ids]);
-	}
-	db.run(`DELETE FROM memory_embeddings WHERE memory_id IN (${placeholders})`, [...ids]);
-	for (const table of MEMORIA_SOURCE_TABLES) {
-		db.run(`DELETE FROM ${table} WHERE source_memory_id IN (${placeholders})`, [...ids]);
-	}
+	if (options.factTiers === undefined) {
+		// Content edits reuse this helper but must keep the source's
+		// annotations: they describe the memory itself (occurred_on, has_source,
+		// caller-added metadata) and survive a rewording, so the edit path opts
+		// out here.
+		if (!options.preserveAnnotations) {
+			db.run(`DELETE FROM annotations WHERE memory_id IN (${placeholders})`, [...ids]);
+		}
+		db.run(`DELETE FROM memory_embeddings WHERE memory_id IN (${placeholders})`, [...ids]);
+		for (const table of MEMORIA_SOURCE_TABLES) {
+			db.run(`DELETE FROM ${table} WHERE source_memory_id IN (${placeholders})`, [...ids]);
+		}
 
-	if (tableExists(db, "gists")) {
-		db.run(`DELETE FROM gists WHERE memory_id IN (${placeholders})`, [...ids]);
+		if (tableExists(db, "gists")) {
+			db.run(`DELETE FROM gists WHERE memory_id IN (${placeholders})`, [...ids]);
+		}
 	}
 	if (tableExists(db, "graph_edges")) {
 		const refs = [...graphRefs];
@@ -350,21 +367,28 @@ async function runFactExtraction(
 			// trimmed before the task captured its version) is rejected
 			// outright. Facts otherwise inherit the scheduled scope, never
 			// wider than their source.
-			const source = beam.db
-				.prepare("SELECT rowid, content, generation, scope FROM working_memory WHERE id = ?")
-				.get(memoryId) as { rowid: number; content: string; generation: string | null; scope: string | null } | null;
-			if (
-				source == null ||
-				scheduled == null ||
-				source.rowid !== scheduled.rowid ||
-				source.content !== scheduled.content ||
-				source.generation !== scheduled.generation ||
-				(source.scope ?? "session") !== scheduledScope
-			) {
-				return;
-			}
-			storeExtractedFactCategories(beam, extracted, 0, memoryId, 0.7, scheduledScope);
-			invalidateCaches(beam);
+			// Validation and persistence are one write unit: a concurrent
+			// forget or force-replace that already committed is seen by the
+			// check inside the transaction (and discarded); one that started
+			// earlier blocks on the write lock until the facts commit — at
+			// which point its own cascade purges them.
+			transaction(beam.db, () => {
+				const source = beam.db
+					.prepare("SELECT rowid, content, generation, scope FROM working_memory WHERE id = ?")
+					.get(memoryId) as { rowid: number; content: string; generation: string | null; scope: string | null } | null;
+				if (
+					source == null ||
+					scheduled == null ||
+					source.rowid !== scheduled.rowid ||
+					source.content !== scheduled.content ||
+					source.generation !== scheduled.generation ||
+					(source.scope ?? "session") !== scheduledScope
+				) {
+					return;
+				}
+				storeExtractedFactCategories(beam, extracted, 0, memoryId, 0.7, scheduledScope);
+				invalidateCaches(beam);
+			});
 		});
 	} catch {
 		// Background fact extraction is best-effort and never surfaces to the caller.
@@ -825,34 +849,49 @@ export function updateWorking(
 				.prepare("SELECT content FROM working_memory WHERE id = ? AND session_id = ?")
 				.get(memoryId, beam.sessionId) as { content: string } | null)
 		: null;
+	const contentChanged = content !== null && oldContent != null && oldContent.content !== content;
+	if (contentChanged) {
+		// Advance the extraction generation on every real content change: a
+		// pending task bound to the old text must be discarded even when a
+		// later edit restores the identical content — the rowid, the created
+		// stamp, and the content itself all match again, and only a per-change
+		// token tells the incarnations apart.
+		assignments.push("generation = ?");
+		params.push(freshGeneration());
+	}
 	params.push(memoryId, beam.sessionId);
-	const result = beam.db.run(
-		`UPDATE working_memory SET ${assignments.join(", ")} WHERE id = ? AND session_id = ?`,
-		params,
-	);
-	if (result.changes > 0) {
-		invalidateCaches(beam);
-		if (content !== null) {
-			// An edited source no longer supports what was extracted from its old
-			// content: retire the source's fact and graph derivatives so they
-			// cannot outlive the statement that produced them (the next
-			// extraction pass re-derives facts from the new content). Skipped
-			// when the content is unchanged so no-op updates keep derivatives.
-			if (oldContent == null || oldContent.content !== content) {
-				// Derivative rows carry an untyped source id, so when the other
-				// tier holds a row with the same id (imported/restored banks)
-				// we cannot tell which tier produced them — purging would
-				// destroy the untouched episode's derivatives. Skip in that
-				// collision; otherwise cascade the full artifact set (facts,
-				// memoria projections, gists, graph edges) via the shared helper.
+	// The source update and the derivative cleanup must commit as one unit:
+	// an exit, a cleanup error, or a concurrent recall between an
+	// autocommitted UPDATE and a later purge would see the new content while
+	// the old (possibly global) facts still pass the live-source checks.
+	const result = transaction(beam.db, () => {
+		const updated = beam.db.run(
+			`UPDATE working_memory SET ${assignments.join(", ")} WHERE id = ? AND session_id = ?`,
+			params,
+		);
+		if (updated.changes > 0) {
+			invalidateCaches(beam);
+			if (contentChanged) {
+				// An edited source no longer supports what was extracted from its
+				// old content: retire its fact and graph derivatives so they
+				// cannot outlive the statement that produced them (the next
+				// extraction pass re-derives facts from the new content). No-op
+				// updates keep derivatives. When the other tier holds a row with
+				// the same id, provenance retires only this tier's derivatives
+				// (working, plus the legacy NULL rows) and leaves the episode's
+				// own facts intact.
 				const episodeCollision =
 					beam.db.prepare("SELECT 1 FROM episodic_memory WHERE id = ?").get(memoryId) !== null;
-				if (!episodeCollision) {
-					purgeWorkingMemoryArtifacts(beam.db, [memoryId], { preserveAnnotations: true });
-				}
+				purgeWorkingMemoryArtifacts(beam.db, [memoryId], {
+					preserveAnnotations: true,
+					factTiers: episodeCollision ? ["working"] : undefined,
+				});
 			}
-			scheduleEmbedding(beam, [{ memoryId, content }]);
 		}
+		return updated;
+	});
+	if (result.changes > 0 && content !== null) {
+		scheduleEmbedding(beam, [{ memoryId, content }]);
 	}
 	return result.changes > 0;
 }
@@ -1066,7 +1105,13 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 			}
 			if (exists) {
 				db.run("DELETE FROM working_memory WHERE id = ?", [id]);
-				purgeWorkingMemoryArtifacts(db, [id]);
+				// Mirror of the episode branch: with a same-id episode row the
+				// untyped id is ambiguous, so retire only the working tier's
+				// derivatives (working, plus the legacy NULL rows).
+				const episodeCollision = episodicExists.get(id) !== null;
+				purgeWorkingMemoryArtifacts(db, [id], {
+					factTiers: episodeCollision ? ["working"] : undefined,
+				});
 				stats.working_memory.overwritten++;
 			} else {
 				stats.working_memory.inserted++;
@@ -1136,12 +1181,12 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 				// the replacement cannot keep derivatives of the overwritten
 				// text (mirrors the working-memory branch above). Derivative
 				// rows are keyed only by the untyped id, so when a working row
-				// with the same id exists the purge cannot tell the tiers apart
-				// — skip it, as the edit path does.
+				// with the same id exists, provenance retires only the episode's
+				// own fact derivatives and leaves the working row's intact.
 				const workingCollision = workingExists.get(id) !== null;
-				if (!workingCollision) {
-					purgeWorkingMemoryArtifacts(db, [id]);
-				}
+				purgeWorkingMemoryArtifacts(db, [id], {
+					factTiers: workingCollision ? ["episodic"] : undefined,
+				});
 				stats.episodic_memory.overwritten++;
 			} else {
 				stats.episodic_memory.inserted++;
