@@ -473,6 +473,63 @@ describe("E7 facts scope migration", () => {
 		}
 	});
 
+	it("beam init backfills fts_facts when adopting a pre-existing facts table", () => {
+		const dbPath = tempDb();
+		{
+			const raw = openDatabase(dbPath);
+			try {
+				raw.run(
+					"CREATE TABLE facts (fact_id TEXT PRIMARY KEY, session_id TEXT, subject TEXT, predicate TEXT, object TEXT, timestamp TEXT, source_msg_id TEXT, confidence REAL, scope TEXT DEFAULT 'session')",
+				);
+				raw.run(
+					"INSERT INTO facts (fact_id, subject, predicate, object, timestamp, scope) VALUES ('f_old', 'Ada', 'works at', 'Example Corp', '2026-01-01T00:00:00.000Z', 'global')",
+				);
+			} finally {
+				closeQuietly(raw);
+			}
+		}
+		const beam = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			// initBeam adopted the facts rows: the index must already be backfilled,
+			// and the first update must refresh it without a missing-index delete.
+			const found = beam.db.query("SELECT count(*) AS n FROM fts_facts WHERE fts_facts MATCH 'Example'").get() as { n: number };
+			expect(found.n).toBe(1);
+			beam.db.run("UPDATE facts SET object = 'Other Corp' WHERE fact_id = 'f_old'");
+			const stale = beam.db.query("SELECT count(*) AS n FROM fts_facts WHERE fts_facts MATCH 'Example'").get() as { n: number };
+			const fresh = beam.db.query("SELECT count(*) AS n FROM fts_facts WHERE fts_facts MATCH 'Other'").get() as { n: number };
+			expect(stale.n).toBe(0);
+			expect(fresh.n).toBe(1);
+		} finally {
+			beam.close();
+		}
+	});
+
+	it("duplicate remember with the same explicit scope does not double-extract", async () => {
+		let llmCalls = 0;
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath: tempDb(),
+			llm: { enabled: true, complete: async () => { llmCalls++; return "The user uses the quorum relay for tokens"; } },
+		});
+		try {
+			const id = memory.remember("I use the quorum relay for tokens", { source: "test", scope: "session", extract: true });
+			expect(id).toBeTruthy();
+			// Callers that always pass the same explicit scope must not start a
+			// second extraction: the stored scope is unchanged, so the pending
+			// task is still valid and a duplicate pass would only re-write the
+			// projection tables.
+			const dup = memory.remember("I use the quorum relay for tokens", { source: "test", scope: "session", extract: true });
+			expect(dup).toBe(id);
+			await memory.flushExtractions();
+			expect(llmCalls).toBe(1);
+			const rows = memory.conn.query("SELECT fact_id FROM facts WHERE source_msg_id = ?").all(id) as { fact_id: string }[];
+			expect(rows.length).toBeGreaterThan(0);
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
+		}
+	});
+
 	it("keeps NULL-owned source rows private to empty session ids", () => {
 		const beam = new BeamMemory({ sessionId: "", dbPath: tempDb() });
 		try {

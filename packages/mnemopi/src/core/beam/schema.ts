@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { factsFtsUpdateTriggerSql } from "../facts-fts";
+import { ensureFactsFtsUpdateTrigger } from "../facts-fts";
 
 type PragmaTableInfoRow = {
 	name: string;
@@ -386,11 +386,14 @@ export function initBeam(db: Database): void {
 			INSERT INTO fts_facts(fts_facts, rowid, subject, predicate, object)
 			VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
 		END`,
-		// In-place UPDATEs (re-stored facts, belief revisions) would leave the
-		// external-content index stale without the shared update trigger
-		// (core/facts-fts.ts), which the standalone graph path uses too.
-		factsFtsUpdateTriggerSql,
 	]);
+	// In-place UPDATEs (re-stored facts, belief revisions) would leave the
+	// external-content index stale without the shared update trigger
+	// (core/facts-fts.ts), which the standalone graph path uses too. When this
+	// index adopts a facts table that already carries rows (a standalone graph
+	// bank), the helper backfills it with a rebuild before enabling updates,
+	// so the first fact update cannot hit a missing-index delete.
+	ensureFactsFtsUpdateTrigger(db);
 
 	for (const table of ["working_memory", "episodic_memory"] as const) {
 		addColumnIfMissing(db, table, "event_date", "TEXT DEFAULT NULL");

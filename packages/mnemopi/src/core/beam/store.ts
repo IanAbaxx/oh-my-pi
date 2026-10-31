@@ -515,6 +515,11 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 
 	const existingId = findDuplicate(beam, content);
 	if (existingId !== null) {
+		// The scope as stored before this duplicate write, so the extraction
+		// reschedule below can tell a real re-scope from a repeated value.
+		const storedScope = beam.db
+			.prepare("SELECT scope FROM working_memory WHERE id = ? AND session_id = ?")
+			.get(existingId, beam.sessionId) as { scope: string | null } | undefined;
 		beam.db.run(
 			`
 				UPDATE working_memory
@@ -559,11 +564,18 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 			metadata: metadata ?? undefined,
 		});
 		if (embedText !== content) scheduleEmbedding(beam, [{ memoryId: existingId, content: embedText }]);
-		// A duplicate write that explicitly re-scopes the row invalidates any
-		// pending extraction (its bound scope no longer matches); schedule the
+		// A duplicate write that actually re-scopes the row (the caller named
+		// a different scope than the one stored) invalidates any pending
+		// extraction (its bound scope no longer matches); schedule the
 		// replacement under the updated scope. An omitted scope keeps the
-		// stored value, so the pending task remains valid.
-		if (options.extract === true && options.scope !== undefined) {
+		// stored value, and a repeated identical scope leaves the token
+		// unchanged — in both cases the pending task remains valid, and a
+		// second LLM pass would only duplicate the projection writes.
+		if (
+			options.extract === true &&
+			options.scope !== undefined &&
+			(storedScope?.scope ?? "session") !== options.scope
+		) {
 			scheduleFactExtraction(beam, existingId, options.extractText ?? options.extract_text ?? content);
 		}
 		invalidateCaches(beam);
