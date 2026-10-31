@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { transaction } from "../db";
 
 /** Whether the bank carries the beam bank's fts_facts external-content index. */
 export function bankHasFactsFts(db: Database): boolean {
@@ -37,8 +38,14 @@ export function ensureFactsFtsUpdateTrigger(db: Database): void {
 	if (!bankHasFactsFts(db)) return;
 	const hasTrigger =
 		db.query("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'facts_au'").get() !== null;
-	if (!hasTrigger) {
-		db.run("INSERT INTO fts_facts(fts_facts) VALUES ('rebuild')");
-	}
-	db.run(factsFtsUpdateTriggerSql);
+	// The backfill and the trigger install must commit as one unit: a fact
+	// update committed between a standalone rebuild and the trigger creation
+	// would never be mirrored into the index (stale recall, and a later
+	// trigger-driven delete targeting terms that were never indexed).
+	transaction(db, () => {
+		if (!hasTrigger) {
+			db.run("INSERT INTO fts_facts(fts_facts) VALUES ('rebuild')");
+		}
+		db.run(factsFtsUpdateTriggerSql);
+	});
 }
