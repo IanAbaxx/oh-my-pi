@@ -1718,6 +1718,53 @@ describe("E7 facts scope, review round 3", () => {
 			memory.close();
 		}
 	});
+	it("a mid-flight collision re-scope replaces the pending extraction", async () => {
+		let calls = 0;
+		const g1 = Promise.withResolvers<void>();
+		const g2 = Promise.withResolvers<void>();
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath: tempDb(),
+			llm: {
+				enabled: true,
+				complete: async () => {
+					calls++;
+					if (calls === 1) await g1.promise;
+					if (calls === 2) await g2.promise;
+					return "I use the quorum relay for tokens";
+				},
+			},
+		});
+		try {
+			const id = memory.remember("stored text", { source: "test", scope: "global", extract: true });
+			expect(id).toBeTruthy();
+			for (let i = 0; i < 10_000 && memory.beam.pendingExtractionIds.size !== 1; i++) {
+				await Promise.resolve();
+			}
+			// While the first task waits on the LLM, a same-id episode appears
+			// with a narrower scope: the inherited scope of the working source
+			// changes, so the pending task will discard itself on validation.
+			memory.beam.db.run("INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('" + id + "', 'e', 'session-b', 'session')");
+			// The next identical request must NOT be suppressed — it schedules a
+			// replacement bound to the new (narrower) inherited scope. (Explicit
+			// 'global' scope so the facade default does not re-scope the row.)
+			const dup = memory.remember("stored text", { source: "test", scope: "global", extract: true });
+			expect(dup).toBe(id);
+			for (let i = 0; i < 10_000 && calls !== 2; i++) {
+				await Promise.resolve();
+			}
+			g1.resolve();
+			g2.resolve();
+			await memory.flushExtractions();
+			expect(calls).toBe(2);
+			const row = memory.conn.query("SELECT scope FROM facts WHERE source_msg_id = ?").get(id) as { scope: string } | null;
+			expect(row).not.toBeNull();
+			expect(row!.scope).toBe("session");
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
+		}
+	});
 
 	it("force-import replacing both tiers of a shared id purges the full artifact set", () => {
 		const dbPath = tempDb();

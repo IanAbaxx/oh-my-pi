@@ -467,7 +467,11 @@ function scheduleFactExtraction(beam: BeamMemoryState, memoryId: string, content
 		// A → B → A sequence must honor the latest A), and a task bound to
 		// an older generation discards itself and must not block either.
 		if (scheduled !== null) {
-			const key = memoryId + "\0" + scheduled.generation + "\0" + content;
+			// The inherited scope is part of the key: a mid-flight collision
+			// (a same-id episode appearing or re-scoping to something narrower)
+			// changes the scope this task validates against, so the old task
+			// will discard itself and must NOT suppress the next request.
+			const key = memoryId + "\0" + scheduled.generation + "\0" + content + "\0" + scheduledScope;
 			const generation = scheduled.generation;
 			const set = pendingIds.get(key) ?? new Set<number>();
 			set.add(cancelSeq);
@@ -694,7 +698,12 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		// other.
 			const extractionSource = options.extractText ?? options.extract_text ?? content;
 			const genForKey = refresh.scopeChanged ? null : refresh.generation;
-			const pendingKey = existingId + "\0" + genForKey + "\0" + extractionSource;
+			// The inherited scope is part of the key (see scheduleFactExtraction):
+			// if a same-id episode appeared or re-scoped while the pending task
+			// was waiting on the LLM, the task will discard itself, so the next
+			// request must be scheduled as a replacement, not suppressed.
+			const inheritedScope = refresh.scopeChanged ? null : sourceMemoryScope(beam, existingId);
+			const pendingKey = existingId + "\0" + genForKey + "\0" + extractionSource + "\0" + inheritedScope;
 			// Suppression only counts a task at the LIVE cancellation sequence
 			// for this exact (generation, text): a superseded task must not
 			// block the latest request (A → B → A honors the last A), an
