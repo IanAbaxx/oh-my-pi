@@ -8,6 +8,7 @@ import { EpisodicGraph } from "../episodic-graph";
 import { type ExtractedFactCategories, heuristicExtractFacts } from "../extraction";
 import { clampVeracity, VERACITY_WEIGHTS, type Veracity, VeracityConsolidator } from "../veracity-consolidation";
 import { sourceChannelOf, sourceTierOf } from "../facts-fts";
+import { transaction } from "../../db";
 import { sourceMemoryScope } from "./fact-scope";
 import { scheduleEmbedding } from "./helpers";
 import type { BeamMemoryState, BeamStats, JsonValue, MemoriaRetrieveResult, Metadata, SleepResult } from "./types";
@@ -630,24 +631,31 @@ export function storeFactStrings(
 	options: StoreFactStringOptions = {},
 ): number {
 	const routeHeuristicCategories = options.routeHeuristicCategories ?? true;
+	let stored = 0;
 	// Direct calls without an explicit scope inherit the source memory's scope,
 	// the same rule as extractAndStoreFacts — a private source must not produce
-	// global facts.
-	const scope = options.scope ?? (sourceMemoryId !== null ? sourceMemoryScope(beam, sourceMemoryId) : "global");
-	let stored = 0;
-	for (const fact of facts) {
-		insertFactRows(beam, messageIdx, "entity", "fact", fact, fact, importance, sourceMemoryId, scope);
-		stored++;
-		if (!routeHeuristicCategories) continue;
-		const pref = /^The user (prefers|dislikes) (.+)$/i.exec(fact);
-		if (pref?.[2]) {
-			insertPreference(beam, messageIdx, fact, pref[2], sourceMemoryId);
+	// global facts. The scope lookup and every derivative write must commit as
+	// ONE unit: if another process forgets or force-replaces the source between
+	// the lookup and the inserts, its cleanup runs first and this would leave
+	// an orphan fact carrying the source's old (possibly global) scope — and
+	// recall deliberately admits facts whose source no longer exists, so the
+	// orphan would be visible across sessions.
+	transaction(beam.db, () => {
+		const scope = options.scope ?? (sourceMemoryId !== null ? sourceMemoryScope(beam, sourceMemoryId) : "global");
+		for (const fact of facts) {
+			insertFactRows(beam, messageIdx, "entity", "fact", fact, fact, importance, sourceMemoryId, scope);
+			stored++;
+			if (!routeHeuristicCategories) continue;
+			const pref = /^The user (prefers|dislikes) (.+)$/i.exec(fact);
+			if (pref?.[2]) {
+				insertPreference(beam, messageIdx, fact, pref[2], sourceMemoryId);
+			}
+			const instruction = /^Instruction: (.+)$/i.exec(fact);
+			if (instruction?.[1]) {
+				insertInstruction(beam, messageIdx, instruction[1], fact, sourceMemoryId);
+			}
 		}
-		const instruction = /^Instruction: (.+)$/i.exec(fact);
-		if (instruction?.[1]) {
-			insertInstruction(beam, messageIdx, instruction[1], fact, sourceMemoryId);
-		}
-	}
+	});
 	return stored;
 }
 
@@ -660,9 +668,13 @@ export function storeExtractedFactCategories(
 	importance = 0.7,
 	scope?: string,
 ): number {
-	// Same inheritance rule as extractAndStoreFacts: callers that omit the scope
-	// get the source memory's scope instead of an unconditional 'global'.
-	const effectiveScope = scope ?? (sourceMemoryId !== null ? sourceMemoryScope(beam, sourceMemoryId) : "global");
+	// Same inheritance rule as extractAndStoreFacts: callers that omit the
+	// scope get the source memory's scope instead of an unconditional
+	// 'global'. The scope lookup and every derivative write commit as ONE unit
+	// (nested transactions are depth-safe), so a concurrent source cleanup
+	// cannot strand an orphan fact with the source's old scope.
+	const work = () => {
+		const effectiveScope = scope ?? (sourceMemoryId !== null ? sourceMemoryScope(beam, sourceMemoryId) : "global");
 	let stored = storeFactStrings(beam, extracted.facts, messageIdx, sourceMemoryId, importance, { scope: effectiveScope });
 	stored += storeFactStrings(beam, extracted.instructions, messageIdx, sourceMemoryId, importance, {
 		routeHeuristicCategories: false,
@@ -688,7 +700,9 @@ export function storeExtractedFactCategories(
 	for (const triple of extracted.kg) {
 		insertKg(beam, messageIdx, triple.subject, triple.predicate, triple.object, sourceMemoryId);
 	}
-	return stored;
+		return stored;
+	};
+	return transaction(beam.db, work);
 }
 export function extractAndStoreFacts(
 	beam: BeamMemoryState,
@@ -709,10 +723,14 @@ export function extractAndStoreFacts(
 	};
 	const text = String(content ?? "");
 	if (text.length > PATTERN_FACT_EXTRACTION_MAX_INPUT_CHARS) return counts;
-	// Facts inherit the scope of the memory they were extracted from and are
-	// never more visible than that source; only scopeless calls without a
-	// source default to 'global'.
-	const effectiveScope = scope ?? (sourceMemoryId !== null ? sourceMemoryScope(beam, sourceMemoryId) : "global");
+	// The effective-scope lookup and every derivative write must commit as
+	// ONE unit (see storeFactStrings): a concurrent source cleanup must not
+	// be able to slip in between them and strand an orphan fact with the
+	// source's old scope. Facts inherit the scope of the memory they were
+	// extracted from and are never more visible than that source; only
+	// scopeless calls without a source default to 'global'.
+	const work = () => {
+		const effectiveScope = scope ?? (sourceMemoryId !== null ? sourceMemoryScope(beam, sourceMemoryId) : "global");
 	for (const match of text.matchAll(
 		/(\d+(?:[.,]\d+)?)\s*(ms|sec|seconds?|minutes?|hours?|days?|weeks?|months?|%|KB|MB|GB|TB|rows?|columns?|roles?|features?|bugs?|commits?|cards?|users?|items?|tests?|APIs?|endpoints?|sprints?|tickets?)\b/gi,
 	)) {
@@ -800,7 +818,9 @@ export function extractAndStoreFacts(
 	}
 	if (/\b(no longer|not|never|don't|do not|isn't|wasn't)\b/i.test(text)) counts.negation++;
 	if (/\b(decided|decision|choose|chose|approved|rejected)\b/i.test(text)) counts.decision++;
-	return counts;
+		return counts;
+	};
+	return transaction(beam.db, work);
 }
 function classifyAbility(query: string): string {
 	const q = query.toLowerCase();

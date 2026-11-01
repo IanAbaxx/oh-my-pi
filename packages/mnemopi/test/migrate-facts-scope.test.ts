@@ -1620,6 +1620,105 @@ describe("E7 facts scope, review round 3", () => {
 		}
 	});
 
+	it("direct extraction from a vanished source stays private", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			// The source row is gone (forgotten between the caller's snapshot
+			// and the write): the inherited-scope fallback must be the
+			// conservative 'session', never 'global'.
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "ghost-id");
+			const row = beamA.db.query("SELECT scope FROM facts WHERE source_msg_id = 'ghost-id'").get() as { scope: string } | null;
+			expect(row).not.toBeNull();
+			expect(row!.scope).toBe("session");
+			const beamC = new BeamMemory({ sessionId: "session-c", dbPath });
+			try {
+				const hits = factRecall(beamC, "quorum relay", 30) as { content: string }[];
+				expect(hits.some(h => h.content.includes("quorum relay"))).toBe(false);
+			} finally {
+				beamC.close();
+			}
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("background extraction completes for a conservatively-scoped colliding id", async () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		beamA.db.run("INSERT INTO working_memory (id, content, session_id, scope) VALUES ('cfx', 'stored text', 'session-a', 'global')");
+		beamA.db.run("INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('cfx', 'e', 'session-b', 'session')");
+		beamA.close();
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath,
+			llm: {
+				enabled: true,
+				complete: async () => "I use the quorum relay for tokens",
+			},
+		});
+		try {
+			const id = memory.remember("stored text", { source: "test", extract: true });
+			expect(id).toBe("cfx");
+			await memory.flushExtractions();
+			// The conservative inherited scope ('session', narrower of the
+			// colliding pair) must be accepted by the async guard instead of
+			// being rejected against the raw working row's 'global'.
+			const row = memory.conn.query("SELECT scope FROM facts WHERE source_msg_id = 'cfx'").get() as { scope: string } | null;
+			expect(row).not.toBeNull();
+			expect(row!.scope).toBe("session");
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
+		}
+	});
+
+	it("an A to B to A extractText sequence honors the latest request", async () => {
+		let calls = 0;
+		const gates: { promise: Promise<void>; resolve: () => void }[] = [];
+		for (let i = 0; i < 3; i++) gates.push(Promise.withResolvers<void>());
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath: tempDb(),
+			llm: {
+				enabled: true,
+				complete: async () => {
+					calls++;
+					await gates[calls - 1]?.promise;
+					return calls === 2 ? "I use the signal lamp for alerts" : "I use the quorum relay for tokens";
+				},
+			},
+		});
+		try {
+			const id = memory.remember("stored text", { source: "test", extract: true, extractText: "A" });
+			expect(id).toBeTruthy();
+			memory.remember("stored text", { source: "test", extract: true, extractText: "B" });
+			// Back to the original override: the first task was superseded by
+			// B, so it must not suppress this request — a new task takes over.
+			memory.remember("stored text", { source: "test", extract: true, extractText: "A" });
+			for (let i = 0; i < 10_000 && calls !== 3; i++) {
+				await Promise.resolve();
+			}
+			expect(calls).toBe(3);
+			for (const g of gates) g.resolve();
+			await memory.flushExtractions();
+			const objs = (memory.conn.query("SELECT object FROM facts").all() as { object: string }[]).map(r => r.object);
+			// The latest request (A) persists; B was superseded.
+			expect(objs.some(o => o.includes("quorum relay"))).toBe(true);
+			expect(objs.some(o => o.includes("signal lamp"))).toBe(false);
+			// After every task settles, the generation's cancel entry is
+			// retired — the bookkeeping maps do not grow per extraction.
+			for (let i = 0; i < 10_000 && memory.beam.extractionCancelSeq.size !== 0; i++) {
+				await Promise.resolve();
+			}
+			expect(memory.beam.extractionCancelSeq.size).toBe(0);
+			expect(memory.beam.pendingExtractionIds.size).toBe(0);
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
+		}
+	});
+
 	it("force-import replacing both tiers of a shared id purges the full artifact set", () => {
 		const dbPath = tempDb();
 		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });

@@ -389,7 +389,13 @@ async function runFactExtraction(
 					source.rowid !== scheduled.rowid ||
 					source.content !== scheduled.content ||
 					source.generation !== scheduled.generation ||
-					(source.scope ?? "session") !== scheduledScope
+					// Compare against the INHERITED scope (the conservative
+					// combination over any colliding rows), not the raw working
+					// row's scope: a collision can make the inherited scope
+					// narrower than the working row alone, and the raw compare
+					// would reject every background extraction for exactly that
+					// shape.
+					sourceMemoryScope(beam, memoryId) !== scheduledScope
 				) {
 					return;
 				}
@@ -454,21 +460,39 @@ function scheduleFactExtraction(beam: BeamMemoryState, memoryId: string, content
 		void task.finally(() => pending.delete(task));
 	}
 	if (pendingIds !== undefined) {
-		// Keyed by id, generation, AND extraction text: only an identical
-		// pending request coalesces; a different override is a replacement
-		// (the cancellation counter above invalidates the older task), and a
-		// task bound to an older generation is guaranteed to fail validation
-		// so it must not block a request for the current content.
+		// Keyed by id, generation, AND extraction text, holding the cancel
+		// sequence of every task still in flight under that key: only a task
+		// at the LIVE sequence for its generation may suppress a duplicate —
+		// a superseded (canceled) task must not keep blocking requests (an
+		// A → B → A sequence must honor the latest A), and a task bound to
+		// an older generation discards itself and must not block either.
 		if (scheduled !== null) {
 			const key = memoryId + "\0" + scheduled.generation + "\0" + content;
-			// A replacement scheduled while an older task for the same row is
-			// still in flight counts separately; the entry clears only after
-			// the last task for that (id, generation) settles.
-			pendingIds.set(key, (pendingIds.get(key) ?? 0) + 1);
+			const generation = scheduled.generation;
+			const set = pendingIds.get(key) ?? new Set<number>();
+			set.add(cancelSeq);
+			pendingIds.set(key, set);
 			void task.finally(() => {
-				const remaining = (pendingIds.get(key) ?? 1) - 1;
-				if (remaining <= 0) pendingIds.delete(key);
-				else pendingIds.set(key, remaining);
+				const live = pendingIds.get(key);
+				if (live !== undefined) {
+					live.delete(cancelSeq);
+					if (live.size === 0) pendingIds.delete(key);
+				}
+				// Retire the generation's cancel entry only once EVERY task
+				// under it — including superseded ones — has settled, so a
+				// still-running canceled task can never mistake a missing
+				// entry for "live" in the guard.
+				if (beam.extractionCancelSeq !== undefined) {
+					const prefix = memoryId + "\0" + generation + "\0";
+					let anyPending = false;
+					for (const [k, entries] of pendingIds) {
+						if (k.startsWith(prefix) && entries.size > 0) {
+							anyPending = true;
+							break;
+						}
+					}
+					if (!anyPending) beam.extractionCancelSeq.delete(memoryId + "\0" + generation);
+				}
 			});
 		}
 	}
@@ -585,14 +609,23 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 
 	const existingId = findDuplicate(beam, content);
 	if (existingId !== null) {
-		// The scope as stored before this duplicate write, so the extraction
-		// reschedule below can tell a real re-scope from a repeated value.
-		const storedScope = beam.db
-			.prepare("SELECT scope, generation FROM working_memory WHERE id = ? AND session_id = ?")
-			.get(existingId, beam.sessionId) as { scope: string | null; generation: string | null } | undefined;
-		const scopeChanged =
-			options.scope !== undefined && options.scope !== (storedScope?.scope ?? "session");
-		beam.db.run(
+		// The duplicate write must hold the write lock across the stored-row
+		// read and the UPDATE, and re-verify the row still matches `content`
+		// under that lock: a concurrent edit between the duplicate match and
+		// the write would otherwise snapshot the edited row's generation while
+		// scheduling extraction of the OLD text — the async validation (which
+		// re-reads the row) would pass and attach old-text facts to the new
+		// source. A stale match rolls back and falls through to a fresh insert.
+		const refresh = transaction(beam.db, () => {
+			const stored = beam.db
+				.prepare("SELECT content, scope, generation FROM working_memory WHERE id = ? AND session_id = ?")
+				.get(existingId, beam.sessionId) as { content: string; scope: string | null; generation: string | null } | undefined;
+			if (stored == null || stored.content !== content) return null;
+			// The scope as stored before this duplicate write, so the extraction
+			// reschedule below can tell a real re-scope from a repeated value.
+			const scopeChanged =
+				options.scope !== undefined && options.scope !== (stored.scope ?? "session");
+			beam.db.run(
 			`
 				UPDATE working_memory
 				SET importance = MAX(importance, ?), timestamp = ?, source = ?,
@@ -616,7 +649,7 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 				// A real scope change rotates the extraction generation (an ABA
 				// re-scope must not let a pending task bound to the earlier state
 				// revalidate); anything else re-binds the stored token untouched.
-				scopeChanged ? freshGeneration() : (storedScope?.generation ?? null),
+				scopeChanged ? freshGeneration() : stored.generation,
 				validUntil,
 				// An omitted scope keeps the stored value (the variable above was
 				// defaulted to 'session', which would silently narrow a global source).
@@ -632,9 +665,12 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 				existingId,
 				beam.sessionId,
 			],
-		);
-		emitEvent(beam, "MEMORY_UPDATED", {
-			memoryId: existingId,
+			);
+			return { scopeChanged, generation: stored.generation };
+		});
+		if (refresh !== null) {
+			emitEvent(beam, "MEMORY_UPDATED", {
+				memoryId: existingId,
 			content,
 			source,
 			importance,
@@ -656,14 +692,24 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		// (pre-upgrade) carry a NULL generation: both tasks validate against
 		// the same NULL snapshot, so the NULL key suppresses exactly like any
 		// other.
-		const extractionSource = options.extractText ?? options.extract_text ?? content;
-		const pendingKey = existingId + "\0" + (scopeChanged ? null : (storedScope?.generation ?? null)) + "\0" + extractionSource;
-		const pendingHere = beam.pendingExtractionIds?.has(pendingKey) ?? false;
-		if (options.extract === true && (scopeChanged || !pendingHere)) {
-			scheduleFactExtraction(beam, existingId, extractionSource);
+			const extractionSource = options.extractText ?? options.extract_text ?? content;
+			const genForKey = refresh.scopeChanged ? null : refresh.generation;
+			const pendingKey = existingId + "\0" + genForKey + "\0" + extractionSource;
+			// Suppression only counts a task at the LIVE cancellation sequence
+			// for this exact (generation, text): a superseded task must not
+			// block the latest request (A → B → A honors the last A), an
+			// older-generation task discards itself, and legacy NULL-generation
+			// rows suppress exactly like any other key.
+			const liveSeq = beam.extractionCancelSeq?.get(existingId + "\0" + genForKey);
+			const pendingHere =
+				liveSeq !== undefined && (beam.pendingExtractionIds?.get(pendingKey)?.has(liveSeq) ?? false);
+			if (options.extract === true && (refresh.scopeChanged || !pendingHere)) {
+				scheduleFactExtraction(beam, existingId, extractionSource);
+			}
+			invalidateCaches(beam);
+			return existingId;
 		}
-		invalidateCaches(beam);
-		return existingId;
+		// Stale duplicate match: the row changed under us, so insert fresh.
 	}
 
 	const memoryId = options.memoryId ?? options.memory_id ?? generateId(content, new Date(timestamp));
