@@ -42,10 +42,11 @@ export function sourceChannelOf(db: Database, sourceMemoryId: string | null): st
 	if (sourceMemoryId == null || sourceMemoryId === "") return null;
 	try {
 		const working = db.prepare("SELECT channel_id FROM working_memory WHERE id = ?").get(sourceMemoryId) as { channel_id: string | null } | null;
+		const episode = db.prepare("SELECT channel_id FROM episodic_memory WHERE id = ?").get(sourceMemoryId) as { channel_id: string | null } | null;
+		if (working !== null && episode !== null) return null; // ambiguous id: no channel grant
 		if (working !== null) {
 			return typeof working.channel_id === "string" && working.channel_id !== "" ? working.channel_id : null;
 		}
-		const episode = db.prepare("SELECT channel_id FROM episodic_memory WHERE id = ?").get(sourceMemoryId) as { channel_id: string | null } | null;
 		if (episode !== null) {
 			return typeof episode.channel_id === "string" && episode.channel_id !== "" ? episode.channel_id : null;
 		}
@@ -66,8 +67,15 @@ function tierTableHas(db: Database, table: string, id: string): boolean {
 
 export function sourceTierOf(db: Database, sourceMemoryId: string | null): string | null {
 	if (sourceMemoryId == null || sourceMemoryId === "") return null;
-	if (tierTableHas(db, "working_memory", sourceMemoryId)) return "working";
-	if (tierTableHas(db, "episodic_memory", sourceMemoryId)) return "episodic";
+	const inWorking = tierTableHas(db, "working_memory", sourceMemoryId);
+	const inEpisode = tierTableHas(db, "episodic_memory", sourceMemoryId);
+	// Present in BOTH tiers: the untyped id is ambiguous, so stamp NULL —
+	// recall keeps the conservative both-tiers probe. A working-first stamp
+	// would let an episode-derived fact validate against the unrelated
+	// working row (and vice versa).
+	if (inWorking && inEpisode) return null;
+	if (inWorking) return "working";
+	if (inEpisode) return "episodic";
 	return null;
 }
 

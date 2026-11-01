@@ -131,6 +131,7 @@ export class BeamMemory implements BeamMemoryState {
 	readonly config: BeamConfig;
 	readonly pendingExtractions: Set<Promise<void>> = new Set();
 	readonly pendingExtractionIds = new Map<string, number>();
+	readonly extractionCancelSeq = new Map<string, number>();
 	#closed = false;
 
 	constructor(options?: BeamMemoryOptions);

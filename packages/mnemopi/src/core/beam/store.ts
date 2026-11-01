@@ -353,7 +353,7 @@ async function runFactExtraction(
 	beam: BeamMemoryState,
 	memoryId: string,
 	content: string,
-	scheduled: { rowid: number; content: string; generation: string | null } | null,
+	scheduled: { rowid: number; content: string; generation: string | null; cancelSeq: number } | null,
 	scheduledScope: string,
 ): Promise<void> {
 	try {
@@ -393,6 +393,12 @@ async function runFactExtraction(
 				) {
 					return;
 				}
+				// A newer schedule for the same row version (changed extraction
+				// text) invalidated this task.
+				const liveCancelSeq = beam.extractionCancelSeq?.get(memoryId + "\0" + scheduled.generation);
+				if (liveCancelSeq !== undefined && liveCancelSeq !== scheduled.cancelSeq) {
+					return;
+				}
 				storeExtractedFactCategories(beam, extracted, 0, memoryId, 0.7, scheduledScope);
 				invalidateCaches(beam);
 			});
@@ -425,8 +431,21 @@ function scheduleFactExtraction(beam: BeamMemoryState, memoryId: string, content
 		.prepare("SELECT rowid, content, generation FROM working_memory WHERE id = ?")
 		.get(memoryId) as { rowid: number; content: string; generation: string | null } | null;
 	const scheduledScope = sourceMemoryScope(beam, memoryId);
+	// Replacement counter: every schedule for a (id, generation) version
+	// increments it, and the task records its value. A later schedule with
+	// different extraction text for the same row version invalidates the
+	// older task — both would otherwise pass the row validation (which binds
+	// to the stored row, not the text override), and facts unique to the
+	// abandoned override would silently never be extracted.
+	let cancelSeq = 0;
+	if (scheduled !== null) {
+		const cancelKey = memoryId + "\0" + scheduled.generation;
+		const prev = beam.extractionCancelSeq?.get(cancelKey);
+		if (prev !== undefined) cancelSeq = prev + 1;
+		beam.extractionCancelSeq?.set(cancelKey, cancelSeq);
+	}
 	const task = withMnemopiRuntimeOptions(runtimeOptions, () =>
-		runFactExtraction(beam, memoryId, content, scheduled, scheduledScope),
+		runFactExtraction(beam, memoryId, content, scheduled === null ? null : { ...scheduled, cancelSeq }, scheduledScope),
 	);
 	const pending = beam.pendingExtractions;
 	const pendingIds = beam.pendingExtractionIds;
@@ -435,14 +454,13 @@ function scheduleFactExtraction(beam: BeamMemoryState, memoryId: string, content
 		void task.finally(() => pending.delete(task));
 	}
 	if (pendingIds !== undefined) {
-		// Keyed by id AND the snapshot's generation: a task bound to an older
-		// generation is guaranteed to fail validation, so it must not count as
-		// "pending" for suppression purposes (an explicit extraction request
-		// for the current content would otherwise be dropped and the edited
-		// memory left without facts). A null snapshot (source already gone)
-		// likewise never matches a live row.
+		// Keyed by id, generation, AND extraction text: only an identical
+		// pending request coalesces; a different override is a replacement
+		// (the cancellation counter above invalidates the older task), and a
+		// task bound to an older generation is guaranteed to fail validation
+		// so it must not block a request for the current content.
 		if (scheduled !== null) {
-			const key = memoryId + "\0" + scheduled.generation;
+			const key = memoryId + "\0" + scheduled.generation + "\0" + content;
 			// A replacement scheduled while an older task for the same row is
 			// still in flight counts separately; the entry clears only after
 			// the last task for that (id, generation) settles.
@@ -630,16 +648,19 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		// generation rotated above kills the old task. Only a genuinely pending
 		// task is suppressed — re-requesting identical content while the
 		// extraction is still in flight would double-run the LLM.
-		// Suppression only counts a task pending for the CURRENT generation:
-		// the row's token after the refresh above (rotated on a real scope
-		// change, unchanged otherwise). An older-generation task will discard
-		// itself and must not block this request. Legacy rows (pre-upgrade)
-		// carry a NULL generation: both tasks validate against the same NULL
-		// snapshot, so the NULL key must suppress exactly like any other.
-		const pendingKey = existingId + "\0" + (scopeChanged ? null : (storedScope?.generation ?? null));
+		// Suppression only counts a task pending for the CURRENT generation
+		// AND the same extraction text: a different override is a replacement
+		// (the cancellation counter invalidates the in-flight task), while an
+		// identical pending request coalesces. An older-generation task will
+		// discard itself and must not block this request. Legacy rows
+		// (pre-upgrade) carry a NULL generation: both tasks validate against
+		// the same NULL snapshot, so the NULL key suppresses exactly like any
+		// other.
+		const extractionSource = options.extractText ?? options.extract_text ?? content;
+		const pendingKey = existingId + "\0" + (scopeChanged ? null : (storedScope?.generation ?? null)) + "\0" + extractionSource;
 		const pendingHere = beam.pendingExtractionIds?.has(pendingKey) ?? false;
 		if (options.extract === true && (scopeChanged || !pendingHere)) {
-			scheduleFactExtraction(beam, existingId, options.extractText ?? options.extract_text ?? content);
+			scheduleFactExtraction(beam, existingId, extractionSource);
 		}
 		invalidateCaches(beam);
 		return existingId;

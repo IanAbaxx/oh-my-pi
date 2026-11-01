@@ -641,10 +641,12 @@ describe("E7 facts scope migration", () => {
 			beamA.db.run(
 				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('wm-c2', 'working text', 'session-a', 'global')",
 			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "wm-c2");
+			// The colliding episode row appears AFTER the fact was written, so
+			// the fact's provenance is unambiguously the working tier.
 			beamA.db.run(
 				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('wm-c2', 'episode text', 'session-b', 'session')",
 			);
-			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "wm-c2");
 			const before = beamA.db.query("SELECT fact_id FROM facts WHERE source_msg_id = 'wm-c2'").all() as unknown[];
 			expect(before.length).toBeGreaterThan(0);
 
@@ -724,12 +726,14 @@ describe("E7 facts scope migration", () => {
 			beamA.db.run(
 				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('wm-col', 'old text', 'session-a', 'global')",
 			);
-			beamA.db.run(
-				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('wm-col', 'episode text', 'session-b', 'session')",
-			);
 			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "wm-col");
 			const tier = beamA.db.query("SELECT source_tier FROM facts WHERE source_msg_id = 'wm-col'").get() as { source_tier: string | null };
 			expect(tier.source_tier).toBe("working");
+			// The colliding episode row appears AFTER the fact was written (the
+			// stamp reflects the source situation at write time)...
+			beamA.db.run(
+				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('wm-col', 'episode text', 'session-b', 'session')",
+			);
 			const before = beamA.db.query("SELECT fact_id FROM facts WHERE source_msg_id = 'wm-col'").all() as { fact_id: string }[];
 			expect(before.length).toBeGreaterThan(0);
 
@@ -806,10 +810,12 @@ describe("E7 facts scope migration", () => {
 			beamA.db.run(
 				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('wm-dual', 'g', 'session-a', 'global')",
 			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "wm-dual");
+			// The colliding episode row appears AFTER the fact was written, so
+			// the provenance stamp is unambiguously the working tier.
 			beamA.db.run(
 				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('wm-dual', 'e', 'session-b', 'session')",
 			);
-			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "wm-dual");
 			const factId = (beamA.db
 				.query("SELECT fact_id FROM facts WHERE source_msg_id = 'wm-dual'")
 				.get() as { fact_id: string }).fact_id;
@@ -1534,6 +1540,83 @@ describe("E7 facts scope, review round 3", () => {
 			}
 		} finally {
 			beamA.close();
+		}
+	});
+
+	it("public extraction over a colliding id never outshines the narrower source", () => {
+		const dbPath = tempDb();
+		const beamA = new BeamMemory({ sessionId: "session-a", dbPath });
+		try {
+			beamA.db.run(
+				"INSERT INTO working_memory (id, content, session_id, scope) VALUES ('colx', 'w', 'session-a', 'global')",
+			);
+			beamA.db.run(
+				"INSERT INTO episodic_memory (id, content, session_id, scope) VALUES ('colx', 'e', 'session-b', 'session')",
+			);
+			storeFactStrings(beamA, ["I use the quorum relay for tokens"], 0, "colx");
+			const row = beamA.db.query("SELECT scope, source_tier, channel_id FROM facts WHERE source_msg_id = 'colx'").get() as { scope: string; source_tier: string | null; channel_id: string | null };
+			// The untyped id is ambiguous: the fact takes the NARROWER of the
+			// two sources' scopes and no tier/channel stamp, so recall keeps
+			// the conservative both-tiers probe.
+			expect(row.scope).toBe("session");
+			expect(row.source_tier).toBeNull();
+			expect(row.channel_id).toBeNull();
+			// ...and the private episode's owner dominates: no other session
+			// sees the fact — not even the owner of the global working row.
+			const beamC = new BeamMemory({ sessionId: "session-c", dbPath });
+			try {
+				const hits = factRecall(beamC, "quorum relay", 30) as { content: string }[];
+				expect(hits.some(h => h.content.includes("quorum relay"))).toBe(false);
+			} finally {
+				beamC.close();
+			}
+			const own = factRecall(beamA, "quorum relay", 30) as { content: string }[];
+			expect(own.some(h => h.content.includes("quorum relay"))).toBe(false);
+		} finally {
+			beamA.close();
+		}
+	});
+
+	it("a changed extractText replaces the pending extraction instead of coalescing", async () => {
+		let calls = 0;
+		const g1 = Promise.withResolvers<void>();
+		const g2 = Promise.withResolvers<void>();
+		const memory = new Mnemopi({
+			sessionId: "session-a",
+			dbPath: tempDb(),
+			llm: {
+				enabled: true,
+				complete: async () => {
+					calls++;
+					if (calls === 1) await g1.promise;
+					if (calls === 2) await g2.promise;
+					return calls === 1 ? "I use the quorum relay for tokens" : "I use the backup vault for keys";
+				},
+			},
+		});
+		try {
+			const id = memory.remember("stored text", { source: "test", extract: true, extractText: "override A" });
+			expect(id).toBeTruthy();
+			// Same stored content and scope, a different extraction override
+			// while the first task is in flight: a replacement, not a coalesce.
+			const dup = memory.remember("stored text", { source: "test", extract: true, extractText: "override B" });
+			expect(dup).toBe(id);
+			for (let i = 0; i < 10_000 && memory.beam.pendingExtractionIds.size !== 2; i++) {
+				await Promise.resolve();
+			}
+			expect(memory.beam.pendingExtractionIds.size).toBe(2);
+			g1.resolve();
+			g2.resolve();
+			await memory.flushExtractions();
+			expect(calls).toBe(2);
+			// The superseded task's unique facts are discarded; the replacement
+			// task's persist.
+			const objs = (memory.conn.query("SELECT object FROM facts").all() as { object: string }[]).map(r => r.object);
+			expect(objs.some(o => o.includes("backup vault"))).toBe(true);
+			expect(objs.some(o => o.includes("quorum relay"))).toBe(false);
+		} finally {
+			await memory.flushExtractions();
+			memory.close();
 		}
 	});
 
